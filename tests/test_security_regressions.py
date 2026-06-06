@@ -42,6 +42,79 @@ def test_untrusted_context_policy_marks_sources_as_data():
     assert "acknowledge untrusted-source wrapper labels" in UNTRUSTED_CONTEXT_POLICY
 
 
+# ── outbound destination validation ────────────────────────────
+
+def test_url_security_rejects_localhost_and_private_ip():
+    from src.url_security import UnsafeURL, validate_http_url
+
+    with pytest.raises(UnsafeURL):
+        validate_http_url("http://localhost:11434/v1/embeddings")
+    with pytest.raises(UnsafeURL):
+        validate_http_url("http://127.0.0.1:8000/v1")
+    with pytest.raises(UnsafeURL):
+        validate_http_url("http://192.168.1.10/caldav")
+
+
+def test_url_security_allows_public_hostname(monkeypatch):
+    import socket
+    from src import url_security
+
+    monkeypatch.setattr(
+        url_security.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0)),
+        ],
+    )
+
+    assert url_security.validate_http_url("https://example.com/v1") == "https://example.com/v1"
+
+
+def test_ssh_destination_validation_blocks_options_and_shell_port():
+    from src.url_security import validate_ssh_destination, validate_tcp_port
+
+    with pytest.raises(ValueError):
+        validate_ssh_destination("-oProxyCommand=sh")
+    with pytest.raises(ValueError):
+        validate_ssh_destination("user@host;touch")
+    with pytest.raises(ValueError):
+        validate_tcp_port("22;touch /tmp/pwned")
+    assert validate_tcp_port("2222") == "2222"
+
+
+def test_first_run_setup_ignores_spoofed_forwarding_headers():
+    from types import SimpleNamespace
+    from routes.auth_routes import _request_from_loopback
+
+    for header in ("x-forwarded-for", "x-real-ip"):
+        req = SimpleNamespace(
+            client=SimpleNamespace(host="203.0.113.44"),
+            headers={header: "127.0.0.1"},
+        )
+        assert _request_from_loopback(req) is False
+
+
+def test_first_run_setup_allows_direct_loopback_client():
+    from types import SimpleNamespace
+    from routes.auth_routes import _request_from_loopback
+
+    req = SimpleNamespace(
+        client=SimpleNamespace(host="127.0.0.1"),
+        headers={},
+    )
+
+    assert _request_from_loopback(req) is True
+
+
+def test_attachment_target_dir_stays_under_attachment_root():
+    from routes.email_helpers import ATTACHMENTS_DIR, _safe_attachment_target_dir
+
+    target = _safe_attachment_target_dir("../../INBOX", "../42")
+
+    assert str(target).startswith(str(ATTACHMENTS_DIR.resolve()))
+    assert ".." not in target.name
+
+
 # ── secret_storage ─────────────────────────────────────────────
 
 def _import_secret_storage(tmp_path, monkeypatch):

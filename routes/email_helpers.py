@@ -436,6 +436,31 @@ SETTINGS_FILE = Path(_SETTINGS_FILE)
 # a hardcoded /home/<user>/ path.
 ATTACHMENTS_DIR = Path(MAIL_ATTACHMENTS_DIR)
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_attachment_target_dir(folder: str | None = None, message_id: str | None = None) -> Path:
+    """Return an attachment extraction directory confined under ATTACHMENTS_DIR."""
+    import re as _re
+
+    def _safe_segment(value: str | None, default: str) -> str:
+        raw = str(value or "").replace("\\", "/").strip()
+        parts = [part for part in raw.split("/") if part and part not in {".", ".."}]
+        cleaned = "_".join(parts) or default
+        cleaned = _re.sub(r"[^A-Za-z0-9_.@-]+", "_", cleaned).strip("._")
+        return (cleaned or default)[:120]
+
+    root = ATTACHMENTS_DIR.resolve()
+    target = (
+        root
+        / _safe_segment(folder, "mailbox")
+        / _safe_segment(message_id, "message")
+    ).resolve()
+
+    if root != target and root not in target.parents:
+        raise ValueError("Attachment target escapes attachment root")
+
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 COMPOSE_UPLOADS_DIR = ATTACHMENTS_DIR / "_compose"
 COMPOSE_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 SCHEDULED_DB = Path(SCHEDULED_EMAILS_DB)
