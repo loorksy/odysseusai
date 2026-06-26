@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import secrets
 import uuid
 from datetime import datetime
@@ -377,7 +378,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.post("/onboarding")
     async def update_tasks_onboarding(request: Request, body: dict):
-        user = _owner(request)
+        user = _require_task_admin(request)
         prefs = _load_for_user(user) or {}
         prefs["tasks_opened"] = True
         enable = bool(body.get("enabled"))
@@ -423,12 +424,12 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     _ADMIN_ONLY_ACTIONS = {"run_local", "run_script", "ssh_command"}
 
     def _is_admin(user: str | None) -> bool:
-        if not user:
-            return False
         # In-process tool-loopback marker — AuthMiddleware validated
         # the internal token + loopback client before stamping this,
         # so treat as admin-equivalent.
         if user == INTERNAL_TOOL_USER:
+            return True
+        if os.getenv("AUTH_ENABLED", "true").lower() == "false":
             return True
         try:
             from core.auth import AuthManager
@@ -436,9 +437,17 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             if not auth.is_configured:
                 # Unconfigured single-user deploy: trust the local owner.
                 return True
+            if not user:
+                return False
             return bool(auth.is_admin(user))
         except Exception:
             return False
+
+    def _require_task_admin(request: Request) -> str | None:
+        user = _owner(request)
+        if not _is_admin(user):
+            raise HTTPException(403, "Admin only")
+        return user
 
     def _validate_then_task_id(db, then_task_id: Optional[str], user: Optional[str], current_task_id: Optional[str] = None) -> Optional[str]:
         target_id = (then_task_id or "").strip()
@@ -452,11 +461,26 @@ def setup_task_routes(task_scheduler) -> APIRouter:
         target = q.first()
         if not target:
             raise HTTPException(404, "Chained task not found")
+        visited = {target.id}
+        cursor = target
+        while getattr(cursor, "then_task_id", None):
+            next_id = (cursor.then_task_id or "").strip()
+            if current_task_id and next_id == current_task_id:
+                raise HTTPException(400, "Task chain cannot cycle")
+            if next_id in visited:
+                raise HTTPException(400, "Task chain cannot cycle")
+            visited.add(next_id)
+            next_q = db.query(ScheduledTask).filter(ScheduledTask.id == next_id)
+            if user:
+                next_q = next_q.filter(ScheduledTask.owner == user)
+            cursor = next_q.first()
+            if not cursor:
+                break
         return target.id
 
     @router.post("")
     async def create_task(request: Request, req: TaskCreate):
-        user = _owner(request)
+        user = _require_task_admin(request)
 
         # Validate
         if req.task_type in ("llm", "research") and not req.prompt:
@@ -523,15 +547,6 @@ def setup_task_routes(task_scheduler) -> APIRouter:
                 else bool(req.notifications_enabled) if req.notifications_enabled is not None
                 else True
             )
-            # Validate chained task belongs to same owner
-            if req.then_task_id:
-                chain_target = db.query(ScheduledTask).filter(
-                    ScheduledTask.id == req.then_task_id
-                ).first()
-                if not chain_target:
-                    raise HTTPException(400, "Chained task not found")
-                if chain_target.owner != user:
-                    raise HTTPException(403, "Cannot chain to another user's task")
             task = ScheduledTask(
                 id=task_id,
                 owner=user,
@@ -579,7 +594,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     @router.post("/{task_id}/clear-cache")
     async def clear_task_cache(request: Request, task_id: str):
         """Clear derived cache for one built-in task."""
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -671,7 +686,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.put("/{task_id}")
     async def update_task(request: Request, task_id: str, req: TaskUpdate):
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -760,7 +775,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.delete("/{task_id}")
     async def delete_task(request: Request, task_id: str):
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -782,7 +797,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.post("/{task_id}/pause")
     async def pause_task(request: Request, task_id: str):
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -798,7 +813,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.post("/{task_id}/resume")
     async def resume_task(request: Request, task_id: str):
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -821,7 +836,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     @router.post("/{task_id}/revert")
     async def revert_task(request: Request, task_id: str):
         """Reset a built-in (housekeeping) task to its default config."""
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -860,7 +875,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.post("/{task_id}/run")
     async def run_task_now(request: Request, task_id: str, force: bool = False):
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -877,7 +892,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.post("/{task_id}/stop")
     async def stop_task_now(request: Request, task_id: str):
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
@@ -1055,7 +1070,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.post("/{task_id}/webhook-regenerate")
     async def regenerate_webhook(request: Request, task_id: str):
-        user = _owner(request)
+        user = _require_task_admin(request)
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()

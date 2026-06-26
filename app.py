@@ -466,7 +466,8 @@ async def serve_generated_image(filename: str, request: Request):
     except HTTPException:
         raise
     except Exception as _e:
-        logger.warning("Image ownership verification failed for %r", filename, exc_info=_e)
+        logger.error("Image ownership verification failed for %r", filename, exc_info=_e)
+        raise HTTPException(status_code=500, detail="Database error verifying ownership")
     ext = filename.rsplit('.', 1)[-1].lower()
     mime = {
         "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",

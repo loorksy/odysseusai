@@ -49,9 +49,10 @@ def _require_admin(request: Request):
     """Reject non-admin callers. Shell exec is admin-only — never expose to
     regular users; that's RCE-after-signup."""
     auth_manager = getattr(request.app.state, "auth_manager", None)
-    if not auth_manager:
-        # No auth at all — only safe in fully-trusted localhost dev mode
+    if os.getenv("AUTH_ENABLED", "true").lower() == "false":
         return
+    if not auth_manager or not getattr(auth_manager, "is_configured", False):
+        raise HTTPException(403, "Admin only")
     user = getattr(request.state, "current_user", None)
     # In-process tool loopback. The AuthMiddleware already validated the
     # internal token + loopback client before setting this marker, so
