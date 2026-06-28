@@ -17,6 +17,7 @@ import searchChatModule from './js/search-chat.js';
 import { makeWindowDraggable } from './js/windowDrag.js';
 import markdownModule from './js/markdown.js';
 import chatRenderer from './js/chatRenderer.js';
+import { initChatVirtualizer } from './js/chatVirtualizer.js';
 import sessionModule from './js/sessions.js';
 import memoryModule from './js/memory.js';
 import voiceRecorderModule from './js/voiceRecorder.js';
@@ -160,6 +161,7 @@ function initializeEventListeners() {
   // welcome screen since it isn't inside chat-history.
   const _metaCountEl = el('current-meta-count');
   const _chatHistEl = el('chat-history');
+  initChatVirtualizer();
   if (_metaCountEl && _chatHistEl) {
     let _countScheduled = false;
     const _updateMsgCount = () => {
