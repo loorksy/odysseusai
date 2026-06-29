@@ -36,12 +36,25 @@ function linkHtml(text, url) {
   return `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${safeText}</a>`;
 }
 
-function imageHtml(alt, url, title) {
-  const safeUrl = safeLinkUrl(url);
-  if (!safeUrl || safeUrl.startsWith('#')) return escapeHtml(alt || '');
-  const safeAlt = escapeHtml(alt || '');
-  const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
-  return `<img src="${escapeHtml(safeUrl)}" alt="${safeAlt}"${safeTitle} loading="lazy" decoding="async">`;
+// Validate an image URL for `![alt](url)`. The gate mirrors the page CSP
+// (`img-src 'self' data: blob:`): same-origin http(s) — including root-relative
+// uploads like /api/upload/<id>, resolved against the page origin — plus inline
+// data:image and blob:. External http(s) hosts are rejected: the CSP would block
+// them (rendering a broken <img>) and a remote image is a tracking pixel that
+// leaks the viewer's IP/timing, which matters once notes are shared. Want a
+// remote image? Proxy it same-origin. Anything else (javascript:, etc.) → ''.
+function safeImageUrl(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  if (!url) return '';
+  if (/^data:image\/(?:png|jpe?g|gif|webp|svg\+xml);base64,/i.test(url)) return url;
+  if (/^blob:/i.test(url)) return url;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    if (parsed.origin !== window.location.origin) return '';
+    return parsed.href;
+  } catch (_) { return ''; }
+  return '';
 }
 
 function _isModelEndpointUrl(rawUrl) {
@@ -492,7 +505,15 @@ export function mdToHtml(src, opts) {
   // ___ALLOWED_HTML_0___) can leak into quoted HTML/JS samples, because the
   // placeholder gets captured as literal code content and never restored inside
   // the final <pre><code> block.
-  s = s.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
+  //
+  // Handles both ``` and ~~~ fences of any length >=3 (CommonMark): the fence
+  // opens on a 3+ run at line start and closes on a line that is a run of the
+  // SAME char (\1). Pulling tilde and long fences out here — not just simple
+  // triple-backticks — keeps task-looking lines inside a fence from ever
+  // reaching the task-list pass, so the rendered checkbox indices stay in
+  // lockstep with core/notes_markdown.parse_task_lines (and notes.js). It also
+  // stops `~~~` fences from being mauled by the `~~`-strikethrough pass.
+  s = s.replace(/^[ \t]*(`{3,}|~{3,})[ \t]*(\w+)?[^\n]*\n([\s\S]*?)^[ \t]*\1[ \t]*$/gm, (_, _fence, lang, code) => {
     const cleaned = code
       .replace(/\r\n/g, '\n')
       .replace(/[ \t]+$/gm, '')
@@ -535,6 +556,27 @@ export function mdToHtml(src, opts) {
     return placeholder;
   });
 
+  // Markdown images: ![alt](url) → <img>. Must run BEFORE the link handler so
+  // the leading `!` isn't left stranding in front of an <a>. The <img> is
+  // parked in allowedHtmlBlocks so it survives the HTML-escape pass below.
+  s = s.replace(/!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+"([^"]*)")?\s*\)/g, (match, alt, url, title) => {
+    const safe = safeImageUrl(url);
+    if (!safe) return escapeHtml(alt || '');
+    const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
+    // A title of the form "w=NN" carries a display width (percentage) set by the
+    // image resize control; anything else is a real title tooltip.
+    let widthAttr = '', titleAttr = '';
+    const wm = title && /^\s*w=(\d{1,3})\s*$/.exec(title);
+    if (wm) {
+      const w = Math.max(5, Math.min(100, parseInt(wm[1], 10)));
+      widthAttr = ` style="width:${w}%"`;
+    } else if (title) {
+      titleAttr = ` title="${escapeHtml(title)}"`;
+    }
+    allowedHtmlBlocks.push(`<img class="md-img" src="${escapeHtml(safe)}" alt="${escapeHtml(alt || '')}"${widthAttr}${titleAttr} loading="lazy">`);
+    return placeholder;
+  });
+
   // Repair common ways the agent mangles the entity-anchor convention
   // (`[Name](#kind-<id>)`). Models reliably get the single-link case
   // right but slip into other formats when listing many in a table.
@@ -560,12 +602,6 @@ export function mdToHtml(src, opts) {
     new RegExp(`(^|[^\\[(])#(${ANCHOR_KIND}-[A-Za-z0-9_-]+)\\b`, 'g'),
     '$1[#$2](#$2)',
   );
-
-  // Convert markdown images before links so ![alt](url) does not become
-  // literal "!" plus a normal link.
-  s = s.replace(/!\[([^\]\n]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (match, alt, url, title) => {
-    return imageHtml(alt, url, title);
-  });
 
   // Convert markdown links [text](url) to clickable links
   // Internal #hash links navigate in-page; external links open in new tab
@@ -711,14 +747,68 @@ export function mdToHtml(src, opts) {
   s = s.replace(/^(\d+)\. (.*)$/gm, '<oli>$2</oli>');
   s = s.replace(/(?:^|\n)(<oli>[\s\S]*?)(?=\n(?!<oli>)|$)/g, m => `<ol>${m.trim().replace(/<\/?oli>/g, (t) => t === '<oli>' ? '<li>' : '</li>')}</ol>`);
 
-  // GitHub-style task lists (- [ ] / - [x]) → checkbox items. Must run before
-  // the generic unordered-list rule so the "- " prefix isn't consumed first.
-  // Emits <uli> (with a class) so the unordered-list wrapper below treats it
-  // as a list item. Used by plan mode: plan + progress render as a checklist.
-  s = s.replace(/^(?:- |\* )\[([ xX])\] (.*)$/gm, (_m, mark, text) => {
-    const done = mark.toLowerCase() === 'x';
-    return `<uli class="task-item${done ? ' task-done' : ''}"><span class="task-check" aria-hidden="true"></span><span class="task-text">${text}</span></uli>`;
-  });
+  // GitHub-style task lists (- [ ] / - [x]). Two renderers share this syntax;
+  // the caller picks via opts.tasks. Both must run before the generic
+  // unordered-list rule so the "- " prefix / "[ ]" box isn't consumed first.
+  if (opts && opts.tasks === 'interactive') {
+    // Notes preview: interactive checkboxes that notes.js wires up to toggle the
+    // underlying task line. `data-task-index` is the 0-based ordinal among task
+    // lines in the document and must match core/notes_markdown.parse_task_lines
+    // (and notes.js _parseTasks) so toggle-by-index means the same thing on the
+    // card, in the preview, and on the server.
+    //
+    // This walks line-by-line tracking fenced code blocks instead of a single
+    // global regex: a task-looking line inside a ``` / ~~~ fence is a code
+    // sample, not a real item, so it must NOT consume an index. Triple-backtick
+    // blocks are already extracted to placeholders above, but tilde and longer
+    // fences survive as text — counting their task lines here would offset every
+    // real task's index and toggle the wrong line. A fence opens on a 3+ run of
+    // backticks/tildes and closes on the next delimiter of the same char that is
+    // at least as long (CommonMark); the same rule as the Python/notes helpers.
+    let _taskIdx = 0;
+    let _fenceChar = null, _fenceLen = 0;
+    const _FENCE = /^[ \t]*(`{3,}|~{3,})/;
+    // NOTE: the space before the text capture is `[ \t]?`, NOT `\s?` — `\s`
+    // matches a newline; line-by-line here that can't bite, but it keeps the
+    // box/text split identical to the Python and notes.js task regexes.
+    const _TASK = /^([ \t]*)[-*+][ \t]+\[([ xX])\][ \t]?(.*)$/;
+    s = s.split('\n').map((line) => {
+      const fm = _FENCE.exec(line);
+      if (fm) {
+        const marker = fm[1];
+        if (_fenceChar === null) { _fenceChar = marker[0]; _fenceLen = marker.length; }
+        else if (marker[0] === _fenceChar && marker.length >= _fenceLen) { _fenceChar = null; _fenceLen = 0; }
+        return line; // a fence delimiter line is never a task line
+      }
+      if (_fenceChar !== null) return line; // inside a fenced block -> code
+      const m = _TASK.exec(line);
+      if (!m) return line;
+      const ws = m[1], box = m[2], text = m[3];
+      const done = box.toLowerCase() === 'x';
+      let w = 0; for (const ch of ws) w += (ch === '\t') ? 2 : 1;
+      const indent = Math.floor(w / 2);
+      const idx = _taskIdx++;
+      const check = done
+        ? '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+        : '';
+      const pad = indent ? ` style="margin-left:${indent * 18}px"` : '';
+      return `<tli data-task-index="${idx}" data-done="${done ? 1 : 0}"${pad}>` +
+             `<span class="md-task-box" role="checkbox" aria-checked="${done}" tabindex="0" contenteditable="false">${check}</span>` +
+             `<span class="md-task-text">${text}</span></tli>`;
+    }).join('\n');
+    s = s.replace(/(^|\n)((?:<tli[\s\S]*?<\/tli>(?:\n|$))+)/g, (_, prefix, block) =>
+      `${prefix}<ul class="md-tasklist">${block.trim()
+        .replace(/<tli([^>]*)>/g, '<li class="md-task"$1>')
+        .replace(/<\/tli>/g, '</li>')}</ul>`);
+  } else {
+    // Default (plan mode, docs, chat): static checkbox items styled by the
+    // plan-mode CSS (li.task-item). Emits <uli> (with a class) so the
+    // unordered-list wrapper below treats it as a list item.
+    s = s.replace(/^(?:- |\* )\[([ xX])\] (.*)$/gm, (_m, mark, text) => {
+      const done = mark.toLowerCase() === 'x';
+      return `<uli class="task-item${done ? ' task-done' : ''}"><span class="task-check" aria-hidden="true"></span><span class="task-text">${text}</span></uli>`;
+    });
+  }
 
   // Unordered lists. <uli> may carry attributes (task-item class), so the
   // wrapper preserves them when converting <uli ...> → <li ...>.
@@ -732,7 +822,7 @@ export function mdToHtml(src, opts) {
     `<blockquote>${m.trim().replace(/<\/?bq>/g, (t) => t === '<bq>' ? '<p>' : '</p>')}</blockquote>`);
 
   // Paragraphs - but NOT for code block placeholders or allowed HTML
-  s = s.replace(/^(?!<h\d|<ul>|<ol>|<li|<oli>|<\/li>|<pre>|<blockquote>|<bq>|<hr>|___CODE_BLOCK_|___ALLOWED_HTML_|___MATH_BLOCK_|___MERMAID_BLOCK_)([^\n]+)$/gm, '<p>$1</p>');
+  s = s.replace(/^(?!<h\d|<ul|<ol|<li|<oli|<\/li>|<pre>|<blockquote>|<bq>|<hr>|___CODE_BLOCK_|___ALLOWED_HTML_|___MATH_BLOCK_|___MERMAID_BLOCK_)([^\n]+)$/gm, '<p>$1</p>');
 
   // Line breaks within paragraphs
   s = s.replace(/<p>([\s\S]*?)<\/p>/g, (match, content) => {

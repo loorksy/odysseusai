@@ -182,7 +182,9 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
             id=str(_uuid.uuid4()),
             owner=owner,
             title=expected_title,
-            items=json.dumps([{"text": text, "done": False, "checked": False}]),
+            content=f"- [ ] {text}" if text else None,
+            # 'todo' is a pure UI label now (the checklist itself is the task
+            # line in content); kept so the notes panel groups it as before.
             note_type="todo",
             label="calendar",
             due_date=due_date,
