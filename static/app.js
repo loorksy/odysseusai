@@ -124,6 +124,62 @@ async function _createDirectChatFromPreferredModel() {
 // EVENT LISTENERS INITIALIZATION
 // ============================================
 function initializeEventListeners() {
+  // 3-Panel IDE Panel Layout Controls (C35)
+  const toggleFileTreeBtn = el('toggle-file-tree-btn');
+  const hideFileTreeBtn = el('hide-file-tree-btn');
+  const fileTreePanel = el('file-tree-panel');
+
+  if (toggleFileTreeBtn && fileTreePanel) {
+    toggleFileTreeBtn.addEventListener('click', () => {
+      fileTreePanel.classList.toggle('hidden');
+      toggleFileTreeBtn.classList.toggle('active', !fileTreePanel.classList.contains('hidden'));
+    });
+  }
+  if (hideFileTreeBtn && fileTreePanel && toggleFileTreeBtn) {
+    hideFileTreeBtn.addEventListener('click', () => {
+      fileTreePanel.classList.add('hidden');
+      toggleFileTreeBtn.classList.remove('active');
+    });
+  }
+
+  const togglePreviewBtn = el('toggle-preview-btn');
+  const hidePreviewTerminalBtn = el('hide-preview-terminal-btn');
+  const previewTerminalPanel = el('preview-terminal-panel');
+
+  if (togglePreviewBtn && previewTerminalPanel) {
+    togglePreviewBtn.addEventListener('click', () => {
+      previewTerminalPanel.classList.toggle('hidden');
+      togglePreviewBtn.classList.toggle('active', !previewTerminalPanel.classList.contains('hidden'));
+    });
+  }
+  if (hidePreviewTerminalBtn && previewTerminalPanel && togglePreviewBtn) {
+    hidePreviewTerminalBtn.addEventListener('click', () => {
+      previewTerminalPanel.classList.add('hidden');
+      togglePreviewBtn.classList.remove('active');
+    });
+  }
+
+  // Panel tabs (Live Preview / Terminal switching)
+  const tabPreviewBtn = el('tab-preview-btn');
+  const tabTerminalBtn = el('tab-terminal-btn');
+  const previewContent = el('panel-preview-content');
+  const terminalContent = el('panel-terminal-content');
+
+  if (tabPreviewBtn && tabTerminalBtn && previewContent && terminalContent) {
+    tabPreviewBtn.addEventListener('click', () => {
+      tabPreviewBtn.classList.add('active');
+      tabTerminalBtn.classList.remove('active');
+      previewContent.classList.remove('hidden');
+      terminalContent.classList.add('hidden');
+    });
+    tabTerminalBtn.addEventListener('click', () => {
+      tabTerminalBtn.classList.add('active');
+      tabPreviewBtn.classList.remove('active');
+      terminalContent.classList.remove('hidden');
+      previewContent.classList.add('hidden');
+    });
+  }
+
   // Chat form submission
 //  document.getElementById('chat-form').addEventListener('submit', chatModule.handleChatSubmit);
 

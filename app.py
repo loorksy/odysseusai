@@ -609,6 +609,8 @@ memory_router = setup_memory_routes(memory_manager, session_manager, memory_vect
 app.include_router(memory_router)
 from routes.skills_routes import setup_skills_routes
 app.include_router(setup_skills_routes(skills_manager))
+from routes.agent_routes import setup_agent_routes
+app.include_router(setup_agent_routes(skills_manager))
 
 # Chat
 from routes.chat_routes import setup_chat_routes
@@ -659,10 +661,6 @@ app.include_router(setup_model_routes(model_discovery))
 # GitHub Copilot device-flow login
 from routes.copilot_routes import setup_copilot_routes
 app.include_router(setup_copilot_routes())
-
-# ChatGPT Subscription device-flow login
-from routes.chatgpt_subscription_routes import setup_chatgpt_subscription_routes
-app.include_router(setup_chatgpt_subscription_routes())
 
 # TTS
 from routes.tts_routes import setup_tts_routes

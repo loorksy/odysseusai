@@ -1,0 +1,215 @@
+/* ============================================ */
+/* ShadowRealm UI — Theme & Variables           */
+/* ============================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+
+:root {
+  /* Fonts */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Consolas, Monaco, monospace;
+
+  /* Core palette */
+  --bg: #0D0D0F;
+  --fg: #e2e8f0;
+  --panel: #16161a;
+  --border: #232329;
+  --accent-primary: #7B5CF0;
+  
+  --red: #ff4444;
+  --green: #00E5FF;
+  --warn: #ff9800;
+
+  /* Syntax highlighting */
+  --hl-bg: #131317;
+  --hl-fg: #e2e8f0;
+  --hl-keyword: #7B5CF0;
+  --hl-string: #e5c07b;
+  --hl-comment: #6b7280;
+  --hl-function: #00E5FF;
+  --hl-number: #ff9800;
+  --hl-builtin: #56b6c2;
+  --hl-variable: #abb2bf;
+  --hl-params: #a8c0d4;
+
+  /* Semantic colors */
+  --color-error: #ff4444;
+  --color-error-light: #ff6666;
+  --color-success: #00E5FF;
+  --color-warning: #ff9800;
+  --color-danger: #ff4444;
+  --color-recording: #ff3b30;
+  --color-recording-hover: #d63031;
+  --color-muted: #6b7280;
+  --color-muted-alt: #4b5563;
+  --color-accent: #7B5CF0;
+  --color-agent-active: #00E5FF;
+  --color-brand-blue: #7B5CF0;
+  --color-blind-orange: #ff9800;
+  --color-save-green: var(--color-success);
+  --color-link-hover: #00E5FF;
+  --color-subheader: #6b7280;
+  --select-bg: var(--bg);
+  --select-fg: var(--fg);
+  --select-option-bg: var(--panel);
+  --select-option-fg: var(--fg);
+  --select-option-active-bg: var(--accent-primary);
+  --accent-warm: #ff9800;
+}
+
+:root.light {
+  --bg: #f8fafc;
+  --fg: #0f172a;
+  --panel: #ffffff;
+  --border: #e2e8f0;
+  --hl-bg: #f1f5f9;
+  --hl-fg: #0f172a;
+  --hl-keyword: #7B5CF0;
+  --hl-string: #0f172a;
+  --hl-comment: #64748b;
+  --hl-function: #7B5CF0;
+  --hl-number: #ff9800;
+  --hl-builtin: #008fa0;
+  --hl-variable: #334155;
+  --hl-params: #475569;
+  --select-bg: #f1f5f9;
+  --select-fg: var(--fg);
+  --select-option-bg: var(--panel);
+  --select-option-fg: var(--fg);
+  --select-option-active-bg: color-mix(in srgb, var(--accent-primary) 16%, var(--panel));
+}
+
+/* ── Reset & Base ── */
+
+* { box-sizing: border-box; }
+html, body { overflow-x: hidden; height: 100%; margin: 0; overscroll-behavior: none; }
+body {
+  background-color: var(--bg);
+  color: var(--fg);
+  /* Keep the base padding transition for older layout paths that still adjust
+     the body directly. Edge docks reserve workspace room on the flex panes
+     below so left + right docks can coexist without skewing the whole body. */
+  transition: padding-left 160ms cubic-bezier(0.22, 0.61, 0.36, 1),
+              padding-right 160ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  font-family: var(--font-sans);
+  display: flex;
+  height: 100%;
+  height: 100dvh; /* dynamic viewport height — adapts when mobile keyboard opens */
+  overflow: hidden;
+}
+
+/* Self-hosted Fira Code font */
+@font-face { font-family: 'Fira Code'; font-weight: 300; font-style: normal; font-display: swap; src: url('/static/fonts/FiraCode-Light.woff2') format('woff2'); }
+@font-face { font-family: 'Fira Code'; font-weight: 400; font-style: normal; font-display: swap; src: url('/static/fonts/FiraCode-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'Fira Code'; font-weight: 600; font-style: normal; font-display: swap; src: url('/static/fonts/FiraCode-SemiBold.woff2') format('woff2'); }
+
+/* Self-hosted OpenDyslexic — dyslexia-friendly accessibility font option (SIL OFL 1.1) */
+@font-face { font-family: 'OpenDyslexic'; font-weight: 400; font-style: normal; font-display: swap; src: url('/static/fonts/OpenDyslexic-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'OpenDyslexic'; font-weight: 700; font-style: normal; font-display: swap; src: url('/static/fonts/OpenDyslexic-Bold.woff2') format('woff2'); }
+
+/* Code block baseline */
+pre, code, .hljs {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+  line-height: 1.5;
+}
+
+/* Scrollbar styling */
+@supports selector(::-webkit-scrollbar) {
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--panel);
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--accent-primary);
+    border-radius: 4px;
+    border: 2px solid var(--panel);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--green);
+  }
+}
+
+html {
+  scrollbar-color: var(--accent-primary) var(--panel);
+  scrollbar-width: thin;
+}
+
+/* Utility */
+.red-text { color: var(--red); }
+
+/* ── Density Overrides ── */
+
+:root.density-compact { font-size: 13px; }
+:root.density-compact .msg { padding: 6px 10px; margin-bottom: 4px; }
+:root.density-compact .list-item { padding: 4px 8px; }
+:root.density-compact .sidebar .section { padding: 0; }
+:root.density-spacious { font-size: 16px; }
+:root.density-spacious .msg { padding: 14px 18px; margin-bottom: 12px; }
+:root.density-spacious .list-item { padding: 8px 12px; }
+:root.density-spacious .sidebar .section { padding: 0; }
+
+/* ── UI text-size scale (accessibility) ──
+   Density only changes the root font-size, which can't move the many
+   hard-coded px sizes. `zoom` scales the whole UI uniformly (px text
+   included) while keeping layout intact, unlike `transform: scale`. */
+:root.ui-scale-125 { zoom: 1.25; }
+/* `zoom` makes the 100dvh shell render taller than the real viewport, which
+   pushes the bottom-pinned sidebar account/settings row below the fold (and
+   body's overflow:hidden then clips it). Shrink the shell by the same factor
+   so it fits the viewport exactly. */
+:root.ui-scale-125 body { height: calc(100dvh / 1.25); }
+/* Modals/panels under the 1.25x scale: zoom renders a centred, viewport-sized
+   panel ~1.25x taller, pushing its draggable header + close button off-screen
+   (a catch-22 — you can't reach the control to turn the size back down). Divide
+   each max-height by the same factor to keep the original on-screen footprint.
+   Desktop only — the mobile `!important` full-sheet rules win on small screens
+   and stay top-anchored, so their headers are already visible. */
+:root.ui-scale-125 .modal-content          { max-height: calc(85dvh / 1.25); }
+:root.ui-scale-125 .cal-modal-content      { max-height: calc(88dvh / 1.25); }
+:root.ui-scale-125 .settings-modal-content { max-height: calc(85dvh / 1.25); }
+:root.ui-scale-125 #theme-popup            { max-height: min(calc(85dvh / 1.25), 480px); }
+/* Cookbook is the one modal that set its height inline (94vh), which beat the
+   .modal-content compensation above and overflowed the viewport at 1.25x
+   (header + close button pushed off-screen). Own its height here so the same
+   zoom compensation applies. */
+#cookbook-modal .modal-content             { height: 94vh; max-height: 94vh; }
+:root.ui-scale-125 #cookbook-modal .modal-content { height: calc(94dvh / 1.25); max-height: calc(94dvh / 1.25); }
+/* PDF export modal also set its height inline (86vh) at v1.0; that inline cap
+   beat the .modal-content compensation above and shifted ~1vh at Default when
+   removed. Own its height here so Default is byte-for-byte 86vh and the same
+   1.25x compensation applies. */
+.pdf-export-overlay .modal-content { max-height: 86vh; }
+:root.ui-scale-125 .pdf-export-overlay .modal-content { max-height: calc(86dvh / 1.25); }
+
+/* ── Background Patterns ── */
+
+:root { --bg-effect-intensity: 1; }
+
+/* Canvas-based effects — single source of truth for intensity */
+#synapse-canvas, #rain-canvas, #constellations-canvas,
+#perlin-flow-canvas, #petals-canvas, #sparkles-canvas,
+#embers-canvas {
+  opacity: var(--bg-effect-intensity, 1);
+}
+
+body.bg-pattern-dots {
+  background-image: radial-gradient(color-mix(in srgb, var(--bg-effect-color, var(--fg)) calc(5% * var(--bg-effect-intensity, 1)), transparent) 1px, transparent 1px);
+  background-size: 20px 20px; background-attachment: fixed;
+}
+body.bg-pattern-synapse {
+  /* CSS grid as base, canvas pulses overlay */
+  background-image: linear-gradient(color-mix(in srgb, var(--bg-effect-color, var(--fg)) calc(3.5% * var(--bg-effect-intensity, 1)), transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--bg-effect-color, var(--fg)) calc(3.5% * var(--bg-effect-intensity, 1)), transparent) 1px, transparent 1px);
+  background-size: 24px 24px; background-attachment: fixed;
+}
+body.bg-pattern-perlin-flow,
+body.bg-pattern-petals,
+body.bg-pattern-sparkles {
+  /* canvas-only backgrounds */
+}
+
+

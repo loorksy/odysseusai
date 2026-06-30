@@ -1,4 +1,4 @@
-# src/middleware.py
+# core/middleware.py
 # Shared middleware, decorators, and request helpers
 
 import os
@@ -13,8 +13,19 @@ from starlette.responses import Response
 # routes via HTTP loopback (the agent's tool calls don't carry the
 # admin user's session cookie). Set once at import; tools read the
 # same value from this module. Never persisted or exposed externally.
-INTERNAL_TOOL_TOKEN = os.environ.get("ODYSSEUS_INTERNAL_TOKEN") or secrets.token_hex(32)
-INTERNAL_TOOL_HEADER = "X-Odysseus-Internal-Token"
+#
+# Reads SHADOWREALM_INTERNAL_TOKEN first for new deployments.
+# Falls back to the legacy ODYSSEUS_INTERNAL_TOKEN name so existing
+# .env files keep working without changes.
+INTERNAL_TOOL_TOKEN = (
+    os.environ.get("SHADOWREALM_INTERNAL_TOKEN")
+    or os.environ.get("ODYSSEUS_INTERNAL_TOKEN")  # legacy compat
+    or secrets.token_hex(32)
+)
+INTERNAL_TOOL_HEADER = "X-ShadowRealm-Internal-Token"
+# Backward-compat alias — old routes that still reference the Odysseus header
+# name will still match. Remove after Sprint 4 UI cleanup.
+INTERNAL_TOOL_HEADER_LEGACY = "X-Odysseus-Internal-Token"
 # Pseudo-username on in-process tool-loopback requests; require_admin trusts it and it is reserved.
 INTERNAL_TOOL_USER = "internal-tool"
 
@@ -34,11 +45,14 @@ def require_admin(request: Request):
     the in-process internal-tool token used by loopback agent tools.
     """
     # In-process bypass for tool-layer loopback calls. Two paths:
-    # (a) header-direct (caller set X-Odysseus-Internal-Token), or
+    # (a) header-direct (caller set X-ShadowRealm-Internal-Token or legacy alias), or
     # (b) the auth middleware already validated the token and stamped
     #     request.state.current_user = "internal-tool".
     try:
-        hdr = request.headers.get(INTERNAL_TOOL_HEADER)
+        hdr = (
+            request.headers.get(INTERNAL_TOOL_HEADER)
+            or request.headers.get(INTERNAL_TOOL_HEADER_LEGACY)
+        )
         if hdr and secrets.compare_digest(hdr, INTERNAL_TOOL_TOKEN):
             return
         if getattr(request.state, "current_user", None) == INTERNAL_TOOL_USER:

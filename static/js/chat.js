@@ -218,6 +218,14 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     if (!submitBtn) return;
 
     if (state === 'streaming') {
+      // Update agent status UI in sidebar (C36/C37)
+      const dot = document.querySelector('.sidebar-agent-status .status-pulse-dot');
+      const text = document.querySelector('.sidebar-agent-status .status-badge-text');
+      if (dot && text) {
+        dot.className = 'status-pulse-dot running';
+        text.textContent = 'ShadowRealm: Thinking...';
+      }
+
       // Clear any pending transitions from + → arrow swap
       submitBtn.classList.remove('anim-spin', 'anim-spin-swap', 'anim-land', 'mic-mode', 'newchat-mode', 'newchat-expanded', 'recording');
       // Ensure arrow icon is showing before launch
@@ -243,6 +251,14 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       isStreaming = true;
       _startStallWatchdog();
     } else if (state === 'idle') {
+      // Update agent status UI in sidebar (C36/C37)
+      const dot = document.querySelector('.sidebar-agent-status .status-pulse-dot');
+      const text = document.querySelector('.sidebar-agent-status .status-badge-text');
+      if (dot && text) {
+        dot.className = 'status-pulse-dot idle';
+        text.textContent = 'ShadowRealm: Idle';
+      }
+
       submitBtn.dataset.mode = '';
       delete submitBtn.dataset.phase;
       submitBtn.classList.remove('recording');

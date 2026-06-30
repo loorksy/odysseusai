@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ShadowRealm — System Status</title>
+  <meta http-equiv="Content-Security-Policy" content="{{CSP_POLICY}}" />
+  <style>
+    :root {
+      --bg:        #0D0D0F;
+      --surface:   #15151A;
+      --border:    #2A2A35;
+      --primary:   #7B5CF0;
+      --active:    #00E5FF;
+      --text:      #E2E2E8;
+      --muted:     #6B6B7B;
+      --ok:        #22C55E;
+      --warn:      #F59E0B;
+      --err:       #EF4444;
+      --degraded:  #F97316;
+      --radius:    8px;
+      --font-ui:   'Inter', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-ui);
+      min-height: 100vh;
+    }
+
+    /* ---- top bar ---- */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .topbar-brand {
+      font-family: var(--font-mono);
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--primary);
+      letter-spacing: 0.02em;
+      text-decoration: none;
+    }
+    .topbar-brand span { color: var(--active); }
+    .topbar-nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.85rem;
+      margin-left: 16px;
+      transition: color 0.15s;
+    }
+    .topbar-nav a:hover { color: var(--text); }
+
+    /* ---- page layout ---- */
+    .page {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 40px 24px 80px;
+    }
+    h1 {
+      font-size: 1.45rem;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 32px;
+    }
+
+    /* ---- overall badge ---- */
+    .overall-banner {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 20px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--surface);
+      margin-bottom: 32px;
+      transition: border-color 0.3s;
+    }
+    .overall-banner.ok    { border-color: var(--ok); }
+    .overall-banner.warn  { border-color: var(--warn); }
+    .overall-banner.degraded { border-color: var(--degraded); }
+    .overall-banner.error { border-color: var(--err); }
+    .overall-dot {
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      animation: pulse 2.4s ease-in-out infinite;
+    }
+    .ok    .overall-dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .warn  .overall-dot { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+    .degraded .overall-dot { background: var(--degraded); box-shadow: 0 0 8px var(--degraded); }
+    .error .overall-dot { background: var(--err); box-shadow: 0 0 8px var(--err); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; } 50% { opacity: 0.45; }
+    }
+    .overall-label {
+      font-size: 1rem;
+      font-weight: 600;
+    }
+    .overall-ts {
+      margin-left: auto;
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-family: var(--font-mono);
+    }
+    .refresh-btn {
+      margin-left: 12px;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      padding: 4px 10px;
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .refresh-btn:hover { border-color: var(--primary); color: var(--primary); }
+
+    /* ---- service grid ---- */
+    .services-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .service-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      transition: border-color 0.2s;
+    }
+    .service-card:hover { border-color: var(--primary); }
+    .status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      margin-top: 5px;
+    }
+    .status-ok       { background: var(--ok); }
+    .status-warn     { background: var(--warn); }
+    .status-degraded { background: var(--degraded); }
+    .status-error    { background: var(--err); }
+    .status-unknown  { background: var(--muted); }
+    .service-body { flex: 1; min-width: 0; }
+    .service-name {
+      font-size: 0.95rem;
+      font-weight: 600;
+      margin-bottom: 3px;
+      color: var(--text);
+    }
+    .service-message {
+      font-size: 0.82rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .service-right {
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .service-status-label {
+      font-size: 0.78rem;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .label-ok       { color: var(--ok); }
+    .label-warn     { color: var(--warn); }
+    .label-degraded { color: var(--degraded); }
+    .label-error    { color: var(--err); }
+    .label-unknown  { color: var(--muted); }
+    .service-latency {
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      margin-top: 2px;
+    }
+
+    /* ---- skeleton loader ---- */
+    .skeleton { animation: shimmer 1.4s linear infinite; }
+    @keyframes shimmer {
+      0%   { opacity: 0.3; }
+      50%  { opacity: 0.7; }
+       100% { opacity: 0.3; }
+    }
+    .skel-line {
+      height: 14px;
+      border-radius: 4px;
+      background: var(--border);
+      margin-bottom: 8px;
+    }
+
+    /* ---- error state ---- */
+    .fetch-error {
+      padding: 20px;
+      border-radius: var(--radius);
+      border: 1px solid var(--err);
+      background: #1c0b0b;
+      color: var(--err);
+      font-size: 0.88rem;
+      display: none;
+    }
+    .fetch-error a { color: var(--active); }
+
+    /* ---- section header ---- */
+    .section-header {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      margin-bottom: 12px;
+      font-family: var(--font-mono);
+    }
+  </style>
+</head>
+<body>
+
+<!-- ======= TOP BAR ======= -->
+<nav class="topbar">
+  <a class="topbar-brand" href="/">Shadow<span>Realm</span></a>
+  <div class="topbar-nav">
+    <a href="/">Chat</a>
+    <a href="/status" aria-current="page" style="color:var(--text)">Status</a>
+  </div>
+</nav>
+
+<!-- ======= PAGE ======= -->
+<main class="page">
+  <h1>System Status</h1>
+  <p class="subtitle" id="subtitle">Loading service diagnostics…</p>
+
+  <!-- overall banner -->
+  <div class="overall-banner" id="overall-banner">
+    <div class="overall-dot"></div>
+    <span class="overall-label" id="overall-label">Checking…</span>
+    <span class="overall-ts" id="overall-ts">—</span>
+    <button class="refresh-btn" id="refresh-btn" title="Refresh now">↻ Refresh</button>
+  </div>
+
+  <!-- fetch error -->
+  <div class="fetch-error" id="fetch-error">
+    Could not reach <code>/api/diagnostics/services</code>.
+    The app may be starting up or unreachable.
+    <br /><a href="javascript:void(0)" id="retry-link">Try again</a>
+  </div>
+
+  <!-- services list -->
+  <p class="section-header">Services</p>
+  <div class="services-grid" id="services-grid">
+    <!-- skeleton cards while loading -->
+    <div class="service-card skeleton">
+      <div class="status-dot status-unknown"></div>
+      <div class="service-body">
+        <div class="skel-line" style="width:40%"></div>
+        <div class="skel-line" style="width:70%"></div>
+      </div>
+    </div>
+    <div class="service-card skeleton">
+      <div class="status-dot status-unknown"></div>
+      <div class="service-body">
+        <div class="skel-line" style="width:35%"></div>
+        <div class="skel-line" style="width:60%"></div>
+      </div>
+    </div>
+    <div class="service-card skeleton">
+      <div class="status-dot status-unknown"></div>
+      <div class="service-body">
+        <div class="skel-line" style="width:45%"></div>
+        <div class="skel-line" style="width:55%"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script nonce="{{CSP_NONCE}}">
+(function () {
+  'use strict';
+
+  const API_URL = '/api/diagnostics/services';
+  // Auto-refresh every 30 s
+  const REFRESH_INTERVAL_MS = 30_000;
+
+  const grid          = document.getElementById('services-grid');
+  const overallBanner = document.getElementById('overall-banner');
+  const overallLabel  = document.getElementById('overall-label');
+  const overallTs     = document.getElementById('overall-ts');
+  const subtitle      = document.getElementById('subtitle');
+  const fetchError    = document.getElementById('fetch-error');
+  const refreshBtn    = document.getElementById('refresh-btn');
+  const retryLink     = document.getElementById('retry-link');
+
+  // -- status helpers --
+  const STATUS_MAP = {
+    ok:       { dot: 'status-ok',       label: 'label-ok',       text: 'Operational',  banner: 'ok' },
+    healthy:  { dot: 'status-ok',       label: 'label-ok',       text: 'Operational',  banner: 'ok' },
+    warn:     { dot: 'status-warn',     label: 'label-warn',     text: 'Warning',      banner: 'warn' },
+    warning:  { dot: 'status-warn',     label: 'label-warn',     text: 'Warning',      banner: 'warn' },
+    degraded: { dot: 'status-degraded', label: 'label-degraded', text: 'Degraded',     banner: 'degraded' },
+    error:    { dot: 'status-error',    label: 'label-error',    text: 'Error',        banner: 'error' },
+    unhealthy:{ dot: 'status-error',    label: 'label-error',    text: 'Unhealthy',   banner: 'error' },
+  };
+  const DEFAULT_STATUS = { dot: 'status-unknown', label: 'label-unknown', text: 'Unknown', banner: '' };
+
+  function resolve(status) {
+    return STATUS_MAP[(status || '').toLowerCase()] || DEFAULT_STATUS;
+  }
+
+  // -- overall banner state --
+  const OVERALL_LABELS = {
+    ok:       'All Systems Operational',
+    healthy:  'All Systems Operational',
+    warn:     'Partial Degradation',
+    warning:  'Partial Degradation',
+    degraded: 'Degraded Performance',
+    error:    'Service Disruption',
+    unhealthy:'Service Disruption',
+  };
+
+  function updateBanner(overall) {
+    const s = resolve(overall);
+    overallBanner.className = 'overall-banner ' + s.banner;
+    overallLabel.textContent = OVERALL_LABELS[(overall || '').toLowerCase()] || 'Status Unknown';
+  }
+
+  // -- format ISO timestamp to local --
+  function fmtTs(iso) {
+    if (!iso) return '';
+    try {
+      return new Date(iso).toLocaleString(undefined, {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+      });
+    } catch { return iso; }
+  }
+
+  // -- render service cards --
+  function renderServices(services) {
+    if (!Array.isArray(services) || services.length === 0) {
+      grid.innerHTML = '<p style="color:var(--muted);font-size:0.85rem">No services reported.</p>';
+      return;
+    }
+    grid.innerHTML = services.map(svc => {
+      const s = resolve(svc.status);
+      const name    = escHtml(svc.name || svc.service || 'Unknown');
+      const msg     = escHtml(svc.message || svc.detail || svc.error || '');
+      const latency = svc.latency_ms != null
+        ? `<div class="service-latency">${Math.round(svc.latency_ms)} ms</div>` : '';
+      return `
+        <div class="service-card">
+          <div class="status-dot ${s.dot}"></div>
+          <div class="service-body">
+            <div class="service-name">${name}</div>
+            ${msg ? `<div class="service-message">${msg}</div>` : ''}
+          </div>
+          <div class="service-right">
+            <div class="service-status-label ${s.label}">${s.text}</div>
+            ${latency}
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  // -- minimal XSS escape --
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // -- fetch + render --
+  async function load() {
+    fetchError.style.display = 'none';
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = '↻ Refreshing…';
+    try {
+      const res = await fetch(API_URL, { credentials: 'include' });
+      if (res.status === 401 || res.status === 403) {
+        // Redirect to login if session expired
+        window.location.href = '/login?next=/status';
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+
+      // data shape: { overall, services[], timestamp }
+      const overall   = data.overall || 'unknown';
+      const services  = data.services || [];
+      const timestamp = data.timestamp || null;
+
+      updateBanner(overall);
+      overallTs.textContent = timestamp ? 'Updated ' + fmtTs(timestamp) : '';
+      renderServices(services);
+      subtitle.textContent = services.length + ' service' + (services.length !== 1 ? 's' : '') + ' monitored';
+    } catch (err) {
+      fetchError.style.display = 'block';
+      overallBanner.className = 'overall-banner error';
+      overallLabel.textContent = 'Could not load status';
+      subtitle.textContent = 'Diagnostic endpoint unreachable';
+      console.error('[status] fetch error:', err);
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = '\u21bb Refresh';
+    }
+  }
+
+  // -- events --
+  refreshBtn.addEventListener('click', load);
+  retryLink.addEventListener('click', load);
+
+  // -- initial load + auto-refresh --
+  load();
+  setInterval(load, REFRESH_INTERVAL_MS);
+})();
+</script>
+</body>
+</html>
