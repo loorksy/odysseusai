@@ -650,14 +650,77 @@ def test_llama_cpp_linux_bootstrap_checks_cudart_before_cuda_build():
     assert '_odysseus_has_cudart' in script
     assert "grep -q 'libcudart\\.so'" in script
     # lib64 and lib variants for CUDA_HOME and /usr/local/cuda
-    assert '$_cuh/lib64/libcudart.so' in script
-    assert '$_cuh/lib/libcudart.so' in script
-    assert '/usr/local/cuda/lib64/libcudart.so' in script
-    assert '/usr/local/cuda/lib/libcudart.so' in script
+    assert '$_cuh/lib64' in script
+    assert '$_cuh/lib' in script
+    assert '/usr/local/cuda/lib64' in script
+    assert '/usr/local/cuda/lib' in script
     # pip-installed nvidia runtime wheel sibling path
-    assert 'cuda_runtime/lib/libcudart.so' in script
+    assert 'cuda_runtime/lib' in script
+    assert '"$_dir"/lib"${_name}".so*' in script
+    assert '/usr/local/lib/python*/dist-packages/nvidia/cuda_runtime/lib' in script
+    assert '/usr/lib/python*/dist-packages/nvidia/cuda_runtime/lib' in script
+    assert 'printf -v "$_var" "%s" "$_lib"' in script
+    assert '-DCUDA_CUDART=$_odysseus_cuda_cudart' in script
+    assert '-DCUDA_cudart_LIBRARY=$_odysseus_cuda_cudart' in script
+    assert '-DCUDA_cublas_LIBRARY=$_odysseus_cuda_cublas' in script
+    assert '-DCUDA_cublasLt_LIBRARY=$_odysseus_cuda_cublaslt' in script
+    assert 'CCCL_DISABLE_CTK_COMPATIBILITY_CHECK' in script
+    assert 'CMAKE_LIBRARY_PATH' in script
     # entire helper definition precedes the CUDA cmake invocation
     assert script.index('_odysseus_has_cudart') < script.index('DGGML_CUDA=ON')
+
+
+def test_llama_cpp_linux_bootstrap_promotes_system_cuda_wheels():
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert '/usr/local/lib/python*/dist-packages/nvidia/cu12' in script
+    assert '/usr/local/lib/python*/dist-packages/nvidia/cuda_nvcc' in script
+    assert '/usr/lib/python*/dist-packages/nvidia/cu13' in script
+    assert 'cublas/lib' in script
+    assert 'export LD_LIBRARY_PATH="$_culib:${LD_LIBRARY_PATH:-}"' in script
+    assert 'export CMAKE_LIBRARY_PATH="$_culib:${CMAKE_LIBRARY_PATH:-}"' in script
+    assert 'cuda_runtime/include' in script
+    assert 'cublas/include' in script
+
+
+def test_llama_cpp_linux_bootstrap_writes_backend_marker():
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert 'ODYSSEUS_LLAMA_CPP_BACKEND_FILE' in script
+    assert 'ODYSSEUS_LLAMA_CPP_BACKEND_FILE="${ODYSSEUS_LLAMA_CPP_BACKEND_FILE:-$ODYSSEUS_LLAMA_CPP_MANAGED_DIR/backend}"' in script
+    assert 'printf "cuda\\n" > "$ODYSSEUS_LLAMA_CPP_BACKEND_FILE"' in script
+    assert 'printf "cpu\\n" > "$ODYSSEUS_LLAMA_CPP_BACKEND_FILE"' in script
+    assert 'printf "hip\\n" > "$ODYSSEUS_LLAMA_CPP_BACKEND_FILE"' in script
+    assert 'printf "vulkan\\n" > "$ODYSSEUS_LLAMA_CPP_BACKEND_FILE"' in script
+    assert '~/.config/odysseus-llama-cpp-backend' not in script
+
+
+def test_llama_cpp_linux_bootstrap_skips_prebuilt_when_native_cuda_requested():
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert '_odysseus_native_cuda_requested()' in script
+    assert 'Native CUDA llama.cpp build requested' in script
+    assert 'if _odysseus_native_cuda_requested; then' in script
+    assert script.index('if _odysseus_native_cuda_requested; then') < script.index('elif command -v curl')
+    assert script.index('Native CUDA llama.cpp build requested') < script.index('cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON')
+
+
+def test_llama_cpp_linux_bootstrap_persists_prebuilt_under_managed_dir():
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert '$ODYSSEUS_LLAMA_CPP_PREBUILT_DIR' in script
+    assert '$HOME/.cache/odysseus/llama-cpp-prebuilt' not in script
+    assert '> "$ODYSSEUS_LLAMA_CPP_RUNTIME_ENV"' in script
+    assert '> "$ODYSSEUS_LLAMA_CPP_BACKEND_FILE"' in script
+    assert '$HOME/llama.cpp/.odysseus' in script
 
 
 def test_llama_cpp_linux_bootstrap_cuda_cmake_present_when_cudart_found():
@@ -695,6 +758,52 @@ def test_llama_cpp_linux_bootstrap_uses_single_shell_continuations():
     assert not any(line.endswith("\\\\") for line in runner_lines)
 
 
+def test_llama_cpp_serve_bootstrap_clones_when_mount_dir_has_no_source():
+    routes_src = (Path(__file__).resolve().parents[1] / "routes" / "cookbook_routes.py").read_text(encoding="utf-8")
+
+    assert "[ -f llama.cpp/CMakeLists.txt ]" in routes_src
+    assert "git clone --depth 1 https://github.com/ggml-org/llama.cpp llama.cpp" in routes_src
+    assert "[ -d llama.cpp ] || git clone" not in routes_src
+
+
+def test_llama_cpp_serve_bootstrap_invalidates_managed_non_cuda_cache():
+    routes_src = (Path(__file__).resolve().parents[1] / "routes" / "cookbook_routes.py").read_text(encoding="utf-8")
+
+    assert '_odysseus_cuda_requested()' in routes_src
+    assert 'ODYSSEUS_LLAMA_CPP_CUDA' in routes_src
+    assert 'ODYSSEUS_LLAMA_CPP_BACKEND_FILE' in routes_src
+    assert 'cached llama-server is ${_odysseus_llama_backend:-unmarked}; rebuilding' in routes_src
+    assert 'rm -f "$HOME/bin/llama-server" "$ODYSSEUS_LLAMA_CPP_BACKEND_FILE" "$ODYSSEUS_LLAMA_CPP_RUNTIME_ENV"' in routes_src
+    assert 'case "$_odysseus_llama_real" in "$ODYSSEUS_LLAMA_CPP_PREBUILT_DIR/"*) _odysseus_llama_backend="prebuilt-${_odysseus_llama_backend:-unknown}" ;; esac' in routes_src
+    assert 'rm -rf "$HOME/llama.cpp/build" "$HOME/llama.cpp/build-vulkan" "$ODYSSEUS_LLAMA_CPP_PREBUILT_DIR"' in routes_src
+
+
+def test_llama_cpp_serve_prelude_exports_pip_cuda_runtime_before_cached_launch():
+    routes_src = (Path(__file__).resolve().parents[1] / "routes" / "cookbook_routes.py").read_text(encoding="utf-8")
+
+    assert '_odysseus_export_pip_cuda_runtime()' in routes_src
+    assert 'ODYSSEUS_LLAMA_CPP_PIP_CUDA_LIBS' in routes_src
+    assert '[ -r "$ODYSSEUS_LLAMA_CPP_RUNTIME_ENV" ] && . "$ODYSSEUS_LLAMA_CPP_RUNTIME_ENV"' in routes_src
+    assert '$HOME/.config/odysseus-llama-cpp-env' in routes_src
+    assert routes_src.index("runner_lines.append('_odysseus_export_pip_cuda_runtime')") < routes_src.index("runner_lines.append('elif ! command -v llama-server &>/dev/null; then')")
+
+
+def test_llama_cpp_cuda_wheel_reinstall_is_python_fallback_only():
+    routes_src = (Path(__file__).resolve().parents[1] / "routes" / "cookbook_routes.py").read_text(encoding="utf-8")
+
+    assert 'if ! command -v llama-server >/dev/null 2>&1 && command -v nvidia-smi >/dev/null 2>&1' in routes_src
+    assert 'NVIDIA detected but installed llama-cpp-python is CPU-only' in routes_src
+
+
+def test_llama_cpp_serve_uses_managed_runtime_files():
+    routes_src = (Path(__file__).resolve().parents[1] / "routes" / "cookbook_routes.py").read_text(encoding="utf-8")
+
+    assert 'ODYSSEUS_LLAMA_CPP_MANAGED_DIR="${ODYSSEUS_LLAMA_CPP_MANAGED_DIR:-$HOME/llama.cpp/.odysseus}"' in routes_src
+    assert 'ODYSSEUS_LLAMA_CPP_RUNTIME_ENV="${ODYSSEUS_LLAMA_CPP_RUNTIME_ENV:-$ODYSSEUS_LLAMA_CPP_MANAGED_DIR/runtime.env}"' in routes_src
+    assert 'ODYSSEUS_LLAMA_CPP_PREBUILT_DIR="${ODYSSEUS_LLAMA_CPP_PREBUILT_DIR:-$ODYSSEUS_LLAMA_CPP_MANAGED_DIR/prebuilt}"' in routes_src
+    assert 'printf "metal\\\\n" > "$ODYSSEUS_LLAMA_CPP_BACKEND_FILE"' in routes_src
+
+
 def test_llama_cpp_linux_bootstrap_keeps_cpu_fallback_when_no_gpu_toolchain():
     runner_lines = []
     _append_llama_cpp_linux_accel_build_lines(runner_lines)
@@ -710,7 +819,10 @@ def test_llama_cpp_rebuild_cmd_clears_cached_build_paths():
     # Must remove both the cached symlink and the build dir the serve bootstrap
     # links/creates, so the next serve recompiles from source.
     assert 'rm -f "$HOME/bin/llama-server"' in cmd
+    assert 'ODYSSEUS_LLAMA_CPP_MANAGED_DIR="${ODYSSEUS_LLAMA_CPP_MANAGED_DIR:-$HOME/llama.cpp/.odysseus}"' in cmd
+    assert 'rm -f "$ODYSSEUS_LLAMA_CPP_MANAGED_DIR/backend" "$ODYSSEUS_LLAMA_CPP_MANAGED_DIR/runtime.env"' in cmd
     assert 'rm -rf "$HOME/llama.cpp/build"' in cmd
+    assert '"$ODYSSEUS_LLAMA_CPP_MANAGED_DIR/prebuilt"' in cmd
     # Recreates ~/bin so a never-served host does not error on a missing dir.
     assert 'mkdir -p "$HOME/bin"' in cmd
     # Diagnosis-only on the destructive side: it must not install or fetch.
