@@ -2200,6 +2200,7 @@ def setup_model_routes(model_discovery):
         # admin's pick into every new account's composer.
         settings = _load_settings()
         _is_admin = False
+        _using_global_defaults = settings.get("share_defaults_with_users", False)
         try:
             auth_mgr = getattr(request.app.state, "auth_manager", None)
             if _user and auth_mgr is not None and getattr(auth_mgr, "is_admin", None):
@@ -2215,7 +2216,7 @@ def setup_model_routes(model_discovery):
             # If user has no personal default, fall back to global default
             # But only based on the "share_defaults_with_users" flag
             # (only if share_defaults_with_users is enabled)
-            if settings.get("share_defaults_with_users", False):
+            if _using_global_defaults:
                 if not ep_id:
                     ep_id = settings.get("default_endpoint_id", "")
                 if not model:
