@@ -46,6 +46,22 @@ from routes.cookbook_output import (
 
 logger = logging.getLogger(__name__)
 
+
+def _ollama_tag_served(repo_id: str, served: list) -> bool:
+    """Return True if `repo_id` matches a tag the host Ollama daemon serves.
+
+    Ollama tags are `[namespace/]model[:tag]`; an omitted `:tag` defaults to
+    `:latest` on both the request and the server side, so `qwen3` must match a
+    served `qwen3:latest`. Comparison is case-insensitive (Ollama tags are
+    lower-cased) and normalises the implicit `:latest`.
+    """
+    def _norm(name: str) -> str:
+        s = str(name or "").strip().lower()
+        return s if ":" in s else f"{s}:latest"
+    want = _norm(repo_id)
+    return any(_norm(m) == want for m in (served or []))
+
+
 from routes.cookbook_helpers import (
     _SESSION_ID_RE, _validate_repo_id, _validate_serve_model_id, _validate_include, _validate_token,
     _validate_local_dir, _validate_gpus, _shell_path,
@@ -1342,7 +1358,7 @@ def setup_cookbook_routes() -> APIRouter:
             return
         logger.debug(f"crash-watchdog: no exit marker for {session_id} within window; leaving endpoint {endpoint_id}")
 
-    def _auto_register_llm_endpoint(req: ServeRequest, remote: str | None) -> str | None:
+    def _auto_register_llm_endpoint(req: ServeRequest, remote: str | None, *, skip_pin: bool = False) -> str | None:
         """Register a freshly-served LLM as a model endpoint so it appears in the
         model picker without a manual /setup step — the text-model sibling of
         _auto_register_image_endpoint.
@@ -1352,6 +1368,13 @@ def setup_cookbook_routes() -> APIRouter:
         endpoint at that server's /v1; the picker auto-discovers the model id by
         probing /v1/models and dims the endpoint until the server is reachable,
         so registering immediately (before the server finishes loading) is safe.
+
+        `skip_pin` suppresses pinning `req.repo_id` as an available Ollama model
+        when the tag could not be verified against the target daemon (a native
+        local `ollama serve` whose daemon wasn't up yet at launch). The endpoint
+        is still created, but the post-launch /v1/models re-probe decides what it
+        actually serves — so an unpulled tag never shows as a phantom picker
+        entry that chat then can't use.
         """
         logger.info(
             f"_auto_register_llm_endpoint: ENTRY repo_id={req.repo_id!r} "
@@ -1393,6 +1416,11 @@ def setup_cookbook_routes() -> APIRouter:
             host = remote.split("@")[-1] if "@" in remote else remote
         elif re.search(r"\bdocker\s+exec\s+(?:ollama-rocm|ollama-test)\b", req.cmd or ""):
             host = "host.docker.internal"
+        elif (not remote and os.path.exists("/.dockerenv")
+              and re.search(r"\bollama\s+serve\b", req.cmd or "")):
+            # Odysseus in Docker + local ollama serve → host's Ollama is the
+            # actual endpoint; register at host.docker.internal, not localhost.
+            host = "host.docker.internal"
         else:
             host = "localhost"
 
@@ -1405,7 +1433,7 @@ def setup_cookbook_routes() -> APIRouter:
         # agent_loop trusts emitted tool_calls instead of the name heuristic.
         is_ollama_endpoint = "ollama" in (req.cmd or "").lower()
         supports_tools = True if "--enable-auto-tool-choice" in req.cmd else None
-        pinned_models = [req.repo_id] if is_ollama_endpoint and req.repo_id else []
+        pinned_models = [req.repo_id] if is_ollama_endpoint and req.repo_id and not skip_pin else []
 
         db = SessionLocal()
         try:
@@ -1422,6 +1450,15 @@ def setup_cookbook_routes() -> APIRouter:
                     if pinned_models:
                         existing.cached_models = json.dumps(pinned_models)
                         existing.pinned_models = json.dumps(pinned_models)
+                    elif skip_pin:
+                        # Deferred pin (tag unverified — daemon wasn't reachable
+                        # on the port we'll register). Clear any stale pin/cache
+                        # from an earlier launch so a reused endpoint doesn't keep
+                        # showing a phantom picker entry for a model this launch
+                        # couldn't confirm. The live re-probe below repopulates
+                        # cached_models if the daemon actually serves anything.
+                        existing.pinned_models = None
+                        existing.cached_models = None
                 if supports_tools is not None:
                     existing.supports_tools = supports_tools
                 db.commit()
@@ -1593,13 +1630,96 @@ def setup_cookbook_routes() -> APIRouter:
         # `docker exec ollama-test ollama-import …` get wrapped as if they
         # were native `ollama serve`, prepending OLLAMA_HOST=… and then
         # running the ollama-not-found preflight which exits 127.
-        if re.search(r"\bollama\s+serve\b", req.cmd) and "OLLAMA_HOST=" not in req.cmd:
+        _serve_in_container = not remote and os.path.exists("/.dockerenv")
+        # Resolve the final Ollama bind port BEFORE verifying the tag, so the
+        # tag probe and the endpoint we later register point at the SAME daemon.
+        # If the user didn't pin OLLAMA_HOST and 11434 is busy, the port-scan
+        # picks a different free port and rewrites the command to bind there;
+        # probing 11434 in that case would verify a daemon we won't register.
+        # (Container mode skips the scan: it probes 127.0.0.1 = container
+        # loopback, not the host, so it always finds ports "free" and the
+        # result is meaningless — the container path talks to host.docker.internal.)
+        if (re.search(r"\bollama\s+serve\b", req.cmd) and "OLLAMA_HOST=" not in req.cmd
+                and not _serve_in_container):
             _ollama_bind_host = "0.0.0.0" if remote else "127.0.0.1"
             _ollama_chosen_port = _pick_free_port_for_ollama(
                 remote, req.ssh_port, start_port=11434, max_offset=10,
             )
             if _ollama_chosen_port:
                 req.cmd = f"OLLAMA_HOST={_ollama_bind_host}:{_ollama_chosen_port} {req.cmd}"
+
+        # A local `ollama serve` (in-container or native) can only serve tags the
+        # target daemon already has — it never imports an HF-GGUF repo or pulls a
+        # missing tag. Verify against the daemon's native /api/tags before pinning,
+        # so we don't register a model chat will fail to find. Checking the
+        # daemon's real tags (not a slash-in-repo_id heuristic) avoids both
+        # rejecting valid namespaced tags like `library/qwen3:8b` and pinning
+        # unverified bare tags. (Remote hosts use the `docker exec … ollama-import`
+        # helper in cookbook.js, which does import the GGUF, so they skip this
+        # gate.) See branches for why the container / native-reachable /
+        # native-unreachable cases differ. This runs AFTER the port rewrite above
+        # so `_ollama_bind_from_cmd` reads the port we'll actually bind/register.
+        _skip_ollama_pin = False
+        if (not remote and re.search(r"\bollama\s+serve\b", req.cmd)):
+            _host_port = _ollama_bind_from_cmd(req.cmd, default_host="127.0.0.1")[1]
+            _probe_host = "host.docker.internal" if _serve_in_container else "127.0.0.1"
+            # Native /api/tags, not the chat-filtered /v1/models: the latter drops
+            # embedding tags Ollama actually serves, false-rejecting valid models.
+            _host_tags_url = f"http://{_probe_host}:{_host_port}"
+            try:
+                from routes.model_routes import _probe_ollama_tags
+                _served = _probe_ollama_tags(_host_tags_url, timeout=5)
+            except Exception as _pe:
+                logger.warning(f"local-Ollama tag probe failed for {_host_tags_url}: {_pe!r}")
+                _served = []
+            if not _ollama_tag_served(req.repo_id, _served):
+                if _serve_in_container:
+                    # Distinguish "host Ollama unreachable" (empty probe) from
+                    # "tag not installed" so the guidance points at the real fix.
+                    if not _served:
+                        raise HTTPException(
+                            400,
+                            f"Could not reach your host's Ollama at "
+                            f"host.docker.internal:{_host_port} to verify "
+                            f"'{req.repo_id}'. Make sure Ollama is running on your "
+                            f"host machine (not inside this container) and, on Linux, "
+                            f"that docker-compose maps host.docker.internal "
+                            f"(extra_hosts: host-gateway).",
+                        )
+                    raise HTTPException(
+                        400,
+                        f"'{req.repo_id}' is not available in your host's Ollama, so "
+                        f"Odysseus cannot serve it from inside Docker (the container "
+                        f"cannot import a HuggingFace GGUF or pull a missing tag). "
+                        f"Pull it into host Ollama first (`ollama pull {req.repo_id}`), "
+                        f"then select that tag here; or run a llama.cpp/vLLM backend "
+                        f"for a GGUF instead.",
+                    )
+                elif _served:
+                    # Native local, daemon reachable on the port we'll register,
+                    # tag genuinely absent → `ollama serve` will never import/pull
+                    # it, so reject with pull guidance instead of pinning a model
+                    # chat can't use.
+                    raise HTTPException(
+                        400,
+                        f"'{req.repo_id}' is not available in your local Ollama. "
+                        f"`ollama serve` only serves already-pulled models (it does "
+                        f"not import a HuggingFace GGUF or pull a missing tag). "
+                        f"Pull it first (`ollama pull {req.repo_id}`), then select "
+                        f"that tag here; or run a llama.cpp/vLLM backend for a GGUF "
+                        f"instead.",
+                    )
+                else:
+                    # Native local, nothing listening on the port we'll bind/
+                    # register yet (either the daemon isn't up, or the port-scan
+                    # moved us to a fresh free port) → can't verify; let the launch
+                    # proceed but don't pin the unverified tag.
+                    _skip_ollama_pin = True
+                    logger.info(
+                        f"Native-local Ollama daemon unreachable at "
+                        f"{_host_tags_url}; deferring pin of {req.repo_id!r} to "
+                        f"the post-launch model re-probe."
+                    )
         # LOCAL execution on a native-Windows host never uses tmux (detached
         # process path below), regardless of the UI-supplied platform.
         local_windows = IS_WINDOWS and not remote
@@ -1860,25 +1980,47 @@ def setup_cookbook_routes() -> APIRouter:
                 runner_lines.append('  fi')
                 runner_lines.append('  exec 3<&-; exec 3>&-')
                 runner_lines.append('done')
-                runner_lines.append('if ! command -v ollama &>/dev/null; then')
-                # Single-quoted on purpose: backticks inside a double-quoted
-                # echo are command substitution, and this line used to run the
-                # curl|sh installer on the target host instead of printing it.
-                runner_lines.append(f"  echo '{_bash_squote(OLLAMA_MISSING_HINT)}'")
-                runner_lines.append('  echo')
-                runner_lines.append('  echo "=== Process exited with code 127 ==="')
-                runner_lines.append('  exec bash -i')
-                runner_lines.append('fi')
-                runner_lines.append('ODYSSEUS_OLLAMA_URL="http://${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT}"')
-                if remote and _ollama_host in ("0.0.0.0", "::"):
-                    runner_lines.append('echo "[odysseus] WARNING: remote Ollama will bind to ${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT} so Odysseus can reach it from this host."')
-                    runner_lines.append('echo "[odysseus] Ollama has no built-in authentication; expose this only on a trusted LAN/VPN or provide an explicit OLLAMA_HOST with your own access controls."')
-                runner_lines.append('echo "Starting ollama server on ${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT}..."')
-                runner_lines.append('OLLAMA_HOST="${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT}" ollama serve')
-                runner_lines.append('_ody_exit=$?')
-                runner_lines.append('echo')
-                runner_lines.append('echo "=== Process exited with code ${_ody_exit} ==="')
-                runner_lines.append('exec bash -i')
+                _in_container = _serve_in_container
+                if _in_container:
+                    # Odysseus runs inside Docker; ollama binary is not in the
+                    # container. Probe the host's Ollama at host.docker.internal
+                    # and keep the task alive so the registered endpoint stays up.
+                    # Use the same port _ollama_bind_from_cmd extracted so a
+                    # user-pinned port (OLLAMA_HOST=...:11435 in req.cmd) is honoured.
+                    runner_lines.append(f'if ! (exec 3<>/dev/tcp/host.docker.internal/{_ollama_port}) 2>/dev/null; then')
+                    runner_lines.append('  exec 3<&-; exec 3>&-')
+                    runner_lines.append(f'  echo "ERROR: Ollama not reachable at host.docker.internal:{_ollama_port}."')
+                    runner_lines.append('  echo "Make sure Ollama is running on your host machine (not inside this container)."')
+                    runner_lines.append(f'  echo "If Ollama is running but on a different port, update the port in serve settings (current: {_ollama_port})."')
+                    runner_lines.append('  echo "On Linux, also check that host.docker.internal resolves (requires extra_hosts: host-gateway in docker-compose)."')
+                    runner_lines.append('  echo')
+                    runner_lines.append('  echo "=== Process exited with code 127 ==="')
+                    runner_lines.append('  exec bash -i')
+                    runner_lines.append('fi')
+                    runner_lines.append('exec 3<&-; exec 3>&-')
+                    runner_lines.append(f'echo "[odysseus] Ollama detected on host at host.docker.internal:{_ollama_port} — using host Ollama."')
+                    runner_lines.append('echo "[odysseus] Keeping task alive; stop via the Stop button."')
+                    runner_lines.append('while true; do sleep 3600; done')
+                else:
+                    runner_lines.append('if ! command -v ollama &>/dev/null; then')
+                    # Single-quoted on purpose: backticks inside a double-quoted
+                    # echo are command substitution, and this line used to run the
+                    # curl|sh installer on the target host instead of printing it.
+                    runner_lines.append(f"  echo '{_bash_squote(OLLAMA_MISSING_HINT)}'")
+                    runner_lines.append('  echo')
+                    runner_lines.append('  echo "=== Process exited with code 127 ==="')
+                    runner_lines.append('  exec bash -i')
+                    runner_lines.append('fi')
+                    runner_lines.append('ODYSSEUS_OLLAMA_URL="http://${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT}"')
+                    if remote and _ollama_host in ("0.0.0.0", "::"):
+                        runner_lines.append('echo "[odysseus] WARNING: remote Ollama will bind to ${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT} so Odysseus can reach it from this host."')
+                        runner_lines.append('echo "[odysseus] Ollama has no built-in authentication; expose this only on a trusted LAN/VPN or provide an explicit OLLAMA_HOST with your own access controls."')
+                    runner_lines.append('echo "Starting ollama server on ${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT}..."')
+                    runner_lines.append('OLLAMA_HOST="${ODYSSEUS_OLLAMA_HOST}:${ODYSSEUS_OLLAMA_PORT}" ollama serve')
+                    runner_lines.append('_ody_exit=$?')
+                    runner_lines.append('echo')
+                    runner_lines.append('echo "=== Process exited with code ${_ody_exit} ==="')
+                    runner_lines.append('exec bash -i')
             elif "vllm serve" in req.cmd:
                 # vLLM is CUDA/ROCm-only and does not run on macOS at all.
                 runner_lines.append('if [ "$(uname -s)" = "Darwin" ]; then')
@@ -2107,7 +2249,7 @@ def setup_cookbook_routes() -> APIRouter:
         if is_diffusion:
             endpoint_id = _auto_register_image_endpoint(req, remote)
         elif not is_pip_install:
-            endpoint_id = _auto_register_llm_endpoint(req, remote)
+            endpoint_id = _auto_register_llm_endpoint(req, remote, skip_pin=_skip_ollama_pin)
 
         # Crash watchdog: the auto-register above writes the endpoint row
         # IMMEDIATELY (before the server has even bound its port) so the
@@ -2143,8 +2285,18 @@ def setup_cookbook_routes() -> APIRouter:
         except Exception:
             pass
 
+        # Hand the browser the deterministic host-gateway base URL for the
+        # in-container Ollama proxy case, so Stop/Kill cleanup targets the host
+        # daemon even if it fires before the runner's "detected on host" line
+        # reaches the task pane. Without this the JS resolver falls back to
+        # container loopback on empty output and leaves the host model loaded.
+        ollama_base_url = None
+        if (_serve_in_container and re.search(r"\bollama\s+serve\b", req.cmd)):
+            _ob_port = _ollama_bind_from_cmd(req.cmd, default_host="127.0.0.1")[1]
+            ollama_base_url = f"http://host.docker.internal:{_ob_port}"
+
         return {"ok": True, "session_id": session_id, "remote": remote or "local",
-                "endpoint_id": endpoint_id}
+                "endpoint_id": endpoint_id, "ollama_base_url": ollama_base_url}
 
     # ── Server setup (install deps on remote) ──
 

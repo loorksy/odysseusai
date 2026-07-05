@@ -8,6 +8,7 @@ import uiModule from './ui.js';
 import { _diagnose, _showDiagnosis, _clearDiagnosis } from './cookbook-diagnosis.js';
 import { registerMenuDismiss } from './escMenuStack.js';
 import { computeProgressSignal } from './cookbookProgressSignal.js';
+import { _ollamaBaseUrlForTask } from './cookbookOllamaUrl.js';
 import { portOf, nextFreePort } from './cookbookPorts.js';
 
 // Human-friendly badge label for a task's internal status. Avoids surfacing
@@ -1015,21 +1016,11 @@ function _taskLooksOllama(task, outputText = '') {
   return /\bollama\b/i.test(haystack) || /Ollama API ready on port\s+\d+/i.test(haystack);
 }
 
-function _ollamaBaseUrlForTask(task, outputText = '') {
-  const out = String(outputText || '');
-  const ready = out.match(/Ollama API ready on port\s+\d+:\s*(http:\/\/[^\s]+)/i);
-  if (ready) return ready[1].replace(/\/+$/, '');
-  const cmd = String(task?.payload?._cmd || '');
-  const host = cmd.match(/OLLAMA_HOST=([^\s]+)/)?.[1] || '';
-  const port = host.match(/:(\d+)$/)?.[1] || '11434';
-  return `http://127.0.0.1:${port}`;
-}
-
 function _ollamaModelForTask(task) {
   return String(task?.payload?.model || task?.payload?.repo_id || task?.name || '').trim();
 }
 
-function _ollamaUnloadCommand(task, outputText = '') {
+export function _ollamaUnloadCommand(task, outputText = '') {
   if (!_taskLooksOllama(task, outputText)) return '';
   const model = _ollamaModelForTask(task);
   if (!model) return '';
@@ -1043,7 +1034,7 @@ function _ollamaUnloadCommand(task, outputText = '') {
   return inner;
 }
 
-function _endpointUrlForTask(task, outputText = '') {
+export function _endpointUrlForTask(task, outputText = '') {
   if (_taskLooksOllama(task, outputText)) {
     return _ollamaBaseUrlForTask(task, outputText) + '/v1';
   }
@@ -1786,7 +1777,7 @@ export async function _launchServeTask(shortName, repo, cmd, fields, hostOverrid
     // _fields = the exact structured serve-form values used for this launch,
     // so the "Edit / relaunch" button can re-open the Serve panel pre-filled
     // with these precise settings (not just the last-used-for-repo state).
-    const payload = { repo_id: repo, remote_host: _host || undefined, remote_server_key: _serverMetaKey || undefined, remote_server_name: _serverMetaName || undefined, ssh_port: _sp || undefined, _cmd: cmd, _fields: fields || undefined, _env: _usedEnv, _envPath: _usedEnvPath, _gpus: _usedGpus };
+    const payload = { repo_id: repo, remote_host: _host || undefined, remote_server_key: _serverMetaKey || undefined, remote_server_name: _serverMetaName || undefined, ssh_port: _sp || undefined, _cmd: cmd, _fields: fields || undefined, _env: _usedEnv, _envPath: _usedEnvPath, _gpus: _usedGpus, _ollamaBaseUrl: data.ollama_base_url || undefined };
     _addTask(data.session_id, shortName, 'serve', payload);
     uiModule.showToast(`Serving ${shortName}...`);
     // Auto-register may have enabled an existing (offline) endpoint for this
