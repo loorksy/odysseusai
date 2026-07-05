@@ -20,6 +20,7 @@ from pathlib import Path
 
 import httpx
 from core.constants import internal_api_base
+from routes.cookbook_helpers import _ollama_bind_from_cmd
 from src.constants import COOKBOOK_STATE_FILE
 
 logger = logging.getLogger(__name__)
@@ -54,11 +55,11 @@ async def _delete_endpoint_for_task(task: dict) -> None:
     else:
         host = "host.docker.internal"
     port_match = _re.search(r"--port\s+(\d+)", cmd)
-    ollama_host_match = _re.search(r"OLLAMA_HOST=[^\s]*?:(\d+)", cmd)
     if port_match:
         port = int(port_match.group(1))
-    elif ollama_host_match:
-        port = int(ollama_host_match.group(1))
+    elif "OLLAMA_HOST=" in cmd:
+        _, port_str = _ollama_bind_from_cmd(cmd)
+        port = int(port_str)
     elif "ollama" in cmd:
         port = 11434
     else:

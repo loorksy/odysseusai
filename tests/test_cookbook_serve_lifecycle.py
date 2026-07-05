@@ -48,3 +48,48 @@ async def test_tick_persists_only_successfully_stopped_serves(tmp_path, monkeypa
     assert tasks["stop-succeeds"]["_scheduledStopAtMs"] is None
     assert tasks["stop-fails"]["status"] == "running"
     assert tasks["stop-fails"]["_scheduledStopAtMs"] == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_endpoint_targets_ipv6_ollama_port(monkeypatch):
+    deleted_urls = []
+
+    class FakeResponse:
+        status_code = 200
+        content = b'[{"id":"ep-ipv6","base_url":"http://host.docker.internal:11435/v1"}]'
+
+        def json(self):
+            return [
+                {
+                    "id": "ep-ipv6",
+                    "base_url": "http://host.docker.internal:11435/v1",
+                }
+            ]
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            return FakeResponse()
+
+        async def delete(self, url, **kwargs):
+            deleted_urls.append(url)
+            return FakeResponse()
+
+    monkeypatch.setattr(lifecycle.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(lifecycle, "internal_api_base", lambda: "http://test")
+
+    task = {
+        "payload": {"_cmd": "OLLAMA_HOST=[::1]:11435 ollama serve"},
+        "remoteHost": "",
+    }
+    await lifecycle._delete_endpoint_for_task(task)
+
+    assert deleted_urls == ["http://test/api/model-endpoints/ep-ipv6"]
