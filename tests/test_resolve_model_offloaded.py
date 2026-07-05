@@ -12,6 +12,7 @@ import threading
 import time
 
 import src.ai_interaction as ai
+from src.agent_tools import pipeline_tools as pt
 
 
 async def test_do_pipeline_resolves_model_off_the_event_loop(monkeypatch):
@@ -30,7 +31,11 @@ async def test_do_pipeline_resolves_model_off_the_event_loop(monkeypatch):
             state["active"] -= 1
         raise ValueError("no such model")  # early-return path, no LLM call
 
-    monkeypatch.setattr(ai, "_resolve_model", slow_resolve)
+    # do_pipeline moved to agent_tools.pipeline_tools (#3629), which imported
+    # _resolve_model into its own namespace — patch it on the imported module
+    # object (robust vs. other tests reloading the agent_tools package, which
+    # can drop the pipeline_tools submodule attribute a string target needs).
+    monkeypatch.setattr(pt, "_resolve_model", slow_resolve)
 
     content = '[{"model": "m", "instruction": "go"}]'
     results = await asyncio.gather(
@@ -45,7 +50,7 @@ async def test_do_pipeline_resolves_model_off_the_event_loop(monkeypatch):
 async def test_do_pipeline_uses_offloaded_resolution_result(monkeypatch):
     # The offload must also return the resolved tuple, not just propagate errors.
     monkeypatch.setattr(
-        ai, "_resolve_model",
+        pt, "_resolve_model",
         lambda spec, owner=None: ("http://x/v1/chat/completions", "resolved-model", {}),
     )
 

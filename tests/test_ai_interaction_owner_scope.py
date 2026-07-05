@@ -31,12 +31,12 @@ def test_model_listing_and_image_fallback_are_owner_scoped():
     assert "asyncio.to_thread(_resolve_model, model_spec, owner=owner)" in image_body
 
 
-# chat_with_model, list_models and ask_teacher moved to the registry (#3629)
-# and no longer route through dispatch_ai_tool; their owner threading is covered
-# by tests/test_model_interaction_registry.py. The remaining model-ish tools
-# still dispatched here:
+# chat_with_model, list_models, ask_teacher and pipeline moved to the registry
+# (#3629) and no longer route through dispatch_ai_tool; their owner threading is
+# covered by tests/test_model_interaction_registry.py and
+# tests/test_pipeline_tools_registry.py. The remaining model-ish tools still
+# dispatched here:
 @pytest.mark.parametrize("tool,content", [
-    ("pipeline", "gpt-test | summarize this"),
     ("ui_control", "switch_model gpt-test"),
 ])
 async def test_dispatch_passes_owner_to_model_tools(monkeypatch, tool, content):
@@ -46,11 +46,6 @@ async def test_dispatch_passes_owner_to_model_tools(monkeypatch, tool, content):
         seen[name] = {"content": content, "session_id": session_id, "owner": owner}
         return {"ok": True}
 
-    monkeypatch.setattr(
-        ai_interaction,
-        "do_pipeline",
-        lambda content, session_id=None, owner=None: capture("pipeline", content, session_id, owner),
-    )
     monkeypatch.setattr(
         ai_interaction,
         "do_ui_control",
