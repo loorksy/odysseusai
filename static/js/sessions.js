@@ -112,6 +112,7 @@ function _historyUrl(id, { limit = null, offset = null } = {}) {
 
 function _renderHistoryMessage(msg, modelName) {
   const meta = msg.metadata ? { ...msg.metadata, _fromHistory: true } : null;
+  let _groupPeerName = null;
   let displayContent;
   if (typeof msg.content === 'string') {
     displayContent = _displayHistoryContent(msg.content);
@@ -136,20 +137,35 @@ function _renderHistoryMessage(msg, modelName) {
     if (docEditMatch) {
       displayContent = `[Doc edit: ${docEditMatch[1]}] ${docEditMatch[3]}`;
     }
+    // In a group chat, a peer agent's turn is persisted as a role:'user'
+    // message prefixed with "[name]: " (see group.js). On reload, render it as
+    // that agent (left, named) like the live group view, not the local user.
+    const _grpSession = sessions.find(s => s.id === currentSessionId);
+    if (_grpSession && _grpSession.name && _grpSession.name.startsWith('[GRP]')) {
+      const peerMatch = displayContent.match(/^\[([^\]\n]+)\]:\s+([\s\S]*)$/);
+      if (peerMatch) {
+        _groupPeerName = peerMatch[1];
+        displayContent = peerMatch[2];
+      }
+    }
   }
   const box = document.getElementById('chat-history');
   if (!box) return null;
   if (chatRenderer.hideWelcomeScreen) chatRenderer.hideWelcomeScreen();
 
+  const _renderRole = _groupPeerName ? 'assistant' : msg.role;
   const wrap = document.createElement('div');
-  wrap.className = 'msg ' + (msg.role === 'user' ? 'msg-user' : 'msg-ai');
+  wrap.className = 'msg ' + (_renderRole === 'user' ? 'msg-user' : 'msg-ai');
   wrap.dataset.raw = displayContent;
   if (meta?._db_id) wrap.dataset.dbId = meta._db_id;
 
   const roleEl = document.createElement('div');
   roleEl.className = 'role';
-  if (msg.role === 'user') {
+  if (_renderRole === 'user') {
     roleEl.textContent = 'You';
+  } else if (_groupPeerName) {
+    roleEl.textContent = _groupPeerName;
+    if (chatRenderer.applyModelColor) chatRenderer.applyModelColor(roleEl, _groupPeerName);
   } else {
     const pair = chatRenderer.replyModelPair ? chatRenderer.replyModelPair(modelName, meta) : {};
     const resolved = pair.actualModel || pair.requestedModel || modelName;
