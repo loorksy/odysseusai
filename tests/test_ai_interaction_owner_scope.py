@@ -19,45 +19,48 @@ def test_model_resolver_applies_owner_filter():
 
 
 def test_model_listing_and_image_fallback_are_owner_scoped():
-    # list_models moved to agent_tools.model_interaction_tools (#3629).
-    list_body = _source(model_interaction_tools.list_models)
-    image_body = _source(ai_interaction.do_generate_image)
+    from src.agent_tools.image_tools import GenerateImageTool
+    from src.agent_tools.model_interaction_tools import list_models as do_list_models
+    list_body = _source(do_list_models)
+    image_body = _source(GenerateImageTool.execute)
 
     assert "owner: Optional[str] = None" in list_body
     assert "owner_filter(query, ModelEndpoint, owner)" in list_body
-    # _resolve_model is offloaded to a worker thread (#4589) but stays owner-scoped.
-    assert "asyncio.to_thread(_resolve_model, candidate, owner=owner)" in image_body
+    # _resolve_model calls are owner-scoped (no longer wrapped in asyncio.to_thread).
+    assert "_resolve_model(candidate, owner=owner)" in image_body
     assert "owner_filter(_img_q, ModelEndpoint, owner)" in image_body
-    assert "asyncio.to_thread(_resolve_model, model_spec, owner=owner)" in image_body
+    assert "_resolve_model(model_spec, owner=owner)" in image_body
 
 
-# chat_with_model, list_models and ask_teacher moved to the registry (#3629)
-# and no longer route through dispatch_ai_tool; their owner threading is covered
-# by tests/test_model_interaction_registry.py. The remaining model-ish tools
-# still dispatched here:
+# Tools moved to the registry (#3629) — dispatch_ai_tool now delegates to
+# TOOL_HANDLERS. These tests verify owner / session_id are threaded through
+# the registry wrapper correctly.
 @pytest.mark.parametrize("tool,content", [
-    ("pipeline", "gpt-test | summarize this"),
-    ("ui_control", "switch_model gpt-test"),
+    ("chat_with_model", "gpt-test\nhello"),
+    ("list_models", ""),
+    ("ask_teacher", "gpt-test\nhelp me"),
+    ("create_session", "My Chat\ngpt-test"),
+    ("list_sessions", ""),
 ])
 async def test_dispatch_passes_owner_to_model_tools(monkeypatch, tool, content):
     seen = {}
 
-    async def capture(name, content, session_id=None, owner=None):
-        seen[name] = {"content": content, "session_id": session_id, "owner": owner}
+    async def capture(content_str, ctx):
+        seen[tool] = {"content": content_str, "session_id": ctx.get("session_id"), "owner": ctx.get("owner")}
         return {"ok": True}
 
-    monkeypatch.setattr(
-        ai_interaction,
-        "do_pipeline",
-        lambda content, session_id=None, owner=None: capture("pipeline", content, session_id, owner),
-    )
-    monkeypatch.setattr(
-        ai_interaction,
-        "do_ui_control",
-        lambda content, session_id=None, owner=None: capture("ui_control", content, session_id, owner),
-    )
+    # Patch the TOOL_HANDLERS entry — dispatch_ai_tool delegates to the registry.
+    from src.agent_tools import TOOL_HANDLERS
+    original = TOOL_HANDLERS.get(tool)
+    monkeypatch.setitem(TOOL_HANDLERS, tool, capture)
 
-    _desc, result = await ai_interaction.dispatch_ai_tool(tool, content, session_id="sid1", owner="alice")
+    try:
+        _desc, result = await ai_interaction.dispatch_ai_tool(tool, content, session_id="sid1", owner="alice")
+    finally:
+        if original is not None:
+            TOOL_HANDLERS[tool] = original
+        elif tool in TOOL_HANDLERS:
+            del TOOL_HANDLERS[tool]
 
     assert result == {"ok": True}
     assert seen[tool]["owner"] == "alice"
