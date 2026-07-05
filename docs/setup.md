@@ -257,20 +257,34 @@ do not run on macOS. MLX-only models are not served by Odysseus.
 server; safe to re-run):
 
 ```powershell
+# Clone and jump into the repo
 git clone https://github.com/pewdiepie-archdaemon/odysseus.git
 cd odysseus
-powershell -ExecutionPolicy Bypass -File .\launch-windows.ps1
+
+# Run Odysseus
+.\odysseus run --launch=native
+
+# Seeing a "cannot be loaded because it is not digitally signed" error? Try:
+#   Unblock-File .\odysseus.ps1
+
+# Still no luck, or seeing a "running scripts is disabled on this system" error? Try:
+#   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
 Or do it by hand:
 
 ```powershell
+# Clone and jump into the repo
 git clone https://github.com/pewdiepie-archdaemon/odysseus.git
 cd odysseus
+
+# Setup Odysseus
 py -3.11 -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python setup.py
+
+# Run Odysseus
 python -m uvicorn app:app --host 127.0.0.1 --port 7000
 ```
 
