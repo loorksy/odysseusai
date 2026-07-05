@@ -16,7 +16,7 @@ from core.models import ChatMessage
 from src.request_models import ChatRequest
 from src.llm_core import llm_call_async, stream_llm, stream_llm_with_fallback
 from src.agent_loop import stream_agent_loop
-from src import agent_runs
+from src import agent_run_records, agent_runs
 from src.model_context import estimate_tokens
 from src.chat_helpers import coerce_message_and_session
 from src.endpoint_resolver import normalize_base as _normalize_base, build_chat_url
@@ -38,6 +38,8 @@ from routes.chat_helpers import (
     save_assistant_response,
     run_post_response_tasks,
     clean_thinking_for_save,
+    prepare_agent_response_for_save,
+    prepare_stopped_agent_response_for_save,
     _enforce_chat_privileges,
 )
 from src.action_intents import classify_tool_intent as _classify_tool_intent
@@ -48,6 +50,28 @@ logger = logging.getLogger(__name__)
 # Track active streams for partial-save safety net
 _active_streams: Dict[str, dict] = {}
 _IMAGE_MODEL_PREFIXES = ("gpt-image", "dall-e", "chatgpt-image")
+_DEFAULT_MOUNTED_WORKSPACE = os.environ.get("ODYSSEUS_DEFAULT_WORKSPACE", "/workspace").strip()
+
+
+def _workspace_display_label(workspace: str | None) -> str:
+    ws = str(workspace or "").strip()
+    if not ws:
+        return ""
+    label = os.environ.get("ODYSSEUS_WORKSPACE_LABEL", "").strip()
+    alias_path = os.environ.get("ODYSSEUS_DEFAULT_WORKSPACE", "/workspace").strip()
+    if label and alias_path and os.path.normpath(ws) == os.path.normpath(alias_path):
+        return f"{label} (mounted as {ws})"
+    return ws
+
+
+def _latest_user_message_id(sess) -> str:
+    try:
+        msg = (getattr(sess, "history", None) or [])[-1]
+        if getattr(msg, "role", "") == "user":
+            return str((getattr(msg, "metadata", None) or {}).get("_db_id") or "")
+    except Exception:
+        pass
+    return ""
 
 
 def _stream_set(session_id: str, **fields) -> None:
@@ -63,8 +87,66 @@ def _stream_set(session_id: str, **fields) -> None:
     rec.update(fields)
 
 
+def _save_cancelled_stream_placeholder(
+    session_manager,
+    session_id: str,
+    *,
+    model: str = "",
+    requested_model: str = "",
+    stop_reason: str = "user_stop",
+    incognito: bool = False,
+) -> bool:
+    """Persist an empty stopped assistant row for explicit user cancellation.
+
+    The streaming cancellation path saves partial content when any assistant
+    text exists. This covers the complementary case: the user hits Stop before
+    the model has produced answer tokens. Without a server-side placeholder,
+    a refresh can make that turn look as if it never happened.
+    """
+    if incognito:
+        return False
+    try:
+        sess = session_manager.get_session(session_id)
+    except Exception:
+        return False
+
+    history = getattr(sess, "history", None) or []
+    if history:
+        last = history[-1]
+        md = getattr(last, "metadata", None) or {}
+        if (
+            getattr(last, "role", "") == "assistant"
+            and not (getattr(last, "content", "") or "").strip()
+            and md.get("stopped")
+        ):
+            return False
+
+    selected_model = str(requested_model or getattr(sess, "model", "") or "").strip()
+    actual_model = str(model or selected_model).strip()
+    reason = str(stop_reason or "user_stop")
+    timed_out = reason in {"idle_timeout", "wall_clock_timeout"}
+    metadata = {
+        "stopped": True,
+        "cancelled": reason == "user_stop",
+        "stop_reason": reason,
+    }
+    if timed_out:
+        metadata["timed_out"] = True
+    if actual_model:
+        metadata["model"] = actual_model
+    if selected_model:
+        metadata["requested_model"] = selected_model
+    sess.add_message(ChatMessage("assistant", "", metadata=metadata))
+    try:
+        session_manager.save_sessions()
+    except Exception:
+        logger.exception("Failed to save cancelled placeholder for session %s", session_id)
+        return False
+    return True
+
+
 def _resolve_request_workspace(request, raw_value) -> tuple:
-    """Resolve the posted workspace for this request: (workspace, rejected).
+    """Resolve the workspace for this request: (workspace, rejected).
 
     Privilege is checked BEFORE the path ever touches the filesystem. Only
     admin/single-user callers can use the workspace-backed file/shell tools,
@@ -75,17 +157,26 @@ def _resolve_request_workspace(request, raw_value) -> tuple:
 
     vet_workspace rejects non-directories, sensitive roots (.ssh, .gnupg,
     ...), and filesystem roots; on rejection there is no confinement and the
-    default tool-path allowlist applies. The rejected value is surfaced so the
-    stream can tell an admin client (which believes a workspace is active)
-    that it was dropped.
+    default tool-path allowlist applies. The rejected value is surfaced for
+    posted workspaces so the stream can tell an admin client (which believes a
+    workspace is active) that it was dropped.
+
+    If no workspace is posted, bind the conventional Docker workspace mount
+    when it exists and passes the same vetting. That covers local deployments
+    where /workspace is mounted but the browser has no persisted selection yet.
     """
-    requested = (raw_value or "").strip()
-    if not requested:
-        return "", ""
     from src.tool_security import owner_is_admin_or_single_user
     if not owner_is_admin_or_single_user(get_current_user(request)):
         return "", ""
+
     from src.tool_execution import vet_workspace
+
+    requested = (raw_value or "").strip()
+    if not requested:
+        if _DEFAULT_MOUNTED_WORKSPACE and os.path.isdir(_DEFAULT_MOUNTED_WORKSPACE):
+            return vet_workspace(_DEFAULT_MOUNTED_WORKSPACE) or "", ""
+        return "", ""
+
     workspace = vet_workspace(requested) or ""
     return workspace, (requested if not workspace else "")
 
@@ -904,7 +995,16 @@ def setup_chat_routes(
             web_sources = ctx.web_sources
 
             # Register active stream for partial-save safety net
-            _active_streams[session] = {"status": "streaming", "partial": "", "query": message, "is_research": effective_do_research, "mode": _effective_mode}
+            _active_streams[session] = {
+                "status": "streaming",
+                "partial": "",
+                "query": message,
+                "is_research": effective_do_research,
+                "mode": _effective_mode,
+                "incognito": incognito,
+                "model": getattr(sess, "model", ""),
+                "requested_model": getattr(sess, "model", ""),
+            }
 
             # The client sent a workspace the server refused to bind (deleted
             # folder, file path, sensitive dir, filesystem root). Tell it up
@@ -1249,6 +1349,17 @@ def setup_chat_routes(
                         sess.add_message(ChatMessage("assistant", _stopped_content, metadata=_stopped_md))
                         if not incognito:
                             session_manager.save_sessions()
+                    else:
+                        _stop_reason = agent_runs.get_stop_reason(session)
+                        if _stop_reason:
+                            _save_cancelled_stream_placeholder(
+                                session_manager,
+                                session,
+                                model=_actual_model or _answered_by or _requested_model,
+                                requested_model=_requested_model,
+                                stop_reason=_stop_reason,
+                                incognito=incognito,
+                            )
                     raise
                 finally:
                     _active_streams.pop(session, None)
@@ -1259,6 +1370,9 @@ def setup_chat_routes(
                 _answered_by = None  # set if the selected model failed and a fallback answered
                 _requested_model = sess.model
                 _actual_model = None
+                _agent_round_texts = []
+                _agent_tool_events = []
+                _agent_final_text = ""
                 try:
                     from src.settings import get_setting
                     from src.agent_tools import MAX_AGENT_ROUNDS as _DEFAULT_ROUNDS
@@ -1322,6 +1436,7 @@ def setup_chat_routes(
                                     yield chunk
                                 elif data.get("type") in (
                                     "tool_start", "tool_output", "agent_step",
+                                    "agent_process", "agent_final",
                                     "doc_stream_open", "doc_stream_delta",
                                     "doc_update", "doc_suggestions", "ui_control",
                                     "rounds_exhausted",
@@ -1332,6 +1447,17 @@ def setup_chat_routes(
                                         _agent_rounds = max(_agent_rounds, data.get("round", 1))
                                     elif data.get("type") == "tool_start":
                                         _agent_tool_calls += 1
+                                    elif data.get("type") == "agent_process":
+                                        _agent_round_texts.append(str(data.get("text") or ""))
+                                    elif data.get("type") == "agent_final":
+                                        _agent_final_text = str(data.get("text") or "")
+                                        _agent_round_texts.append(_agent_final_text)
+                                    elif data.get("type") == "tool_output":
+                                        _tool_event = {
+                                            key: value for key, value in data.items()
+                                            if key not in {"type", "ui_event"}
+                                        }
+                                        _agent_tool_events.append(_tool_event)
                                     yield chunk
                                 elif data.get("type") == "fallback":
                                     # Selected model failed; a fallback answered.
@@ -1358,10 +1484,24 @@ def setup_chat_routes(
                             yield chunk
                         elif chunk == "data: [DONE]\n\n":
                             _has_tool_events = bool((last_metrics or {}).get("tool_events"))
-                            if full_response or _has_tool_events:
-                                _response_to_save = full_response or "Done."
+                            if full_response:
+                                final_response, save_metrics = prepare_agent_response_for_save(
+                                    full_response,
+                                    last_metrics,
+                                    user_message=message,
+                                )
+                                _stream_set(session, partial=final_response)
+                                _response_to_save = final_response
+                                _metrics_to_save = save_metrics
+                            elif _has_tool_events:
+                                _response_to_save = "Done."
+                                _metrics_to_save = last_metrics
+                            else:
+                                _response_to_save = ""
+                                _metrics_to_save = last_metrics
+                            if _response_to_save:
                                 _saved_id = save_assistant_response(
-                                    sess, session_manager, session, _response_to_save, last_metrics,
+                                    sess, session_manager, session, _response_to_save, _metrics_to_save,
                                     character_name=ctx.preset.character_name,
                                     web_sources=web_sources,
                                     rag_sources=ctx.rag_sources,
@@ -1372,10 +1512,10 @@ def setup_chat_routes(
                                     yield f'data: {json.dumps({"type": "message_saved", "id": _saved_id})}\n\n'
                                 run_post_response_tasks(
                                     sess, session_manager, session, message, _response_to_save,
-                                    last_metrics, ctx.uprefs, memory_manager, memory_vector, webhook_manager,
+                                    _metrics_to_save, ctx.uprefs, memory_manager, memory_vector, webhook_manager,
                                     incognito=incognito, compare_mode=compare_mode,
                                     character_name=ctx.preset.character_name,
-                                                            agent_rounds=_agent_rounds,
+                                    agent_rounds=_agent_rounds,
                                     agent_tool_calls=_agent_tool_calls,
                                     skills_manager=skills_manager,
                                     owner=_user,
@@ -1392,19 +1532,32 @@ def setup_chat_routes(
                     # outer finally from running and left _active_streams
                     # with a stale entry).
                     try:
-                        if full_response:
-                            logger.info("Client disconnected mid-stream for session %s, saving partial response (%d chars)", session, len(full_response))
-                            _stopped_content2, _stopped_md2 = clean_thinking_for_save(
+                        _stop_reason2 = agent_runs.get_stop_reason(session)
+                        if full_response or _agent_round_texts or _agent_tool_events:
+                            logger.info("Client disconnected mid-agent-stream for session %s, saving stopped placeholder (%d chars hidden)", session, len(full_response))
+                            _stopped_content2, _stopped_md2 = prepare_stopped_agent_response_for_save(
                                 full_response,
-                                {
-                                    "stopped": True,
-                                    "model": _actual_model or _answered_by or _requested_model,
-                                    "requested_model": _requested_model,
-                                },
+                                last_metrics,
+                                observed_round_texts=_agent_round_texts,
+                                observed_tool_events=_agent_tool_events,
+                                final_response=_agent_final_text,
+                                stop_reason=_stop_reason2,
+                                model=_actual_model or _answered_by or _requested_model,
+                                requested_model=_requested_model,
                             )
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))
                             if not incognito:
                                 session_manager.save_sessions()
+                        else:
+                            if _stop_reason2:
+                                _save_cancelled_stream_placeholder(
+                                    session_manager,
+                                    session,
+                                    model=_actual_model or _answered_by or _requested_model,
+                                    requested_model=_requested_model,
+                                    stop_reason=_stop_reason2,
+                                    incognito=incognito,
+                                )
                     except Exception:
                         logger.exception("Failed to save partial response on disconnect (session %s)", session)
                     raise
@@ -1443,7 +1596,20 @@ def setup_chat_routes(
         if compare_mode:
             return StreamingResponse(_safe_stream(), media_type="text/event-stream")
 
-        agent_runs.start(session, _safe_stream())
+        _run_record_id = ""
+        if not incognito:
+            _run_record_id = agent_run_records.begin(
+                session,
+                mode=_effective_mode,
+                model=str(getattr(sess, "model", "") or ""),
+                requested_model=str(getattr(sess, "model", "") or ""),
+                workspace_path=str(workspace or ""),
+                workspace_label=_workspace_display_label(workspace),
+                owner=ctx.user,
+                user_message_id=_latest_user_message_id(sess),
+            )
+
+        agent_runs.start(session, _safe_stream(), record_id=_run_record_id)
         return StreamingResponse(agent_runs.subscribe(session), media_type="text/event-stream")
 
     # ------------------------------------------------------------------ #
@@ -1464,8 +1630,19 @@ def setup_chat_routes(
     @router.post("/api/chat/stop/{session_id}")
     async def chat_stop(request: Request, session_id: str) -> Dict[str, Any]:
         _verify_session_owner(request, session_id)
+        rec = _active_streams.get(session_id) or {}
         stopped = agent_runs.stop(session_id)
-        return {"stopped": stopped}
+        placeholder_saved = False
+        if stopped and not str(rec.get("partial") or "").strip():
+            placeholder_saved = _save_cancelled_stream_placeholder(
+                session_manager,
+                session_id,
+                model=str(rec.get("model") or ""),
+                requested_model=str(rec.get("requested_model") or ""),
+                stop_reason=agent_runs.get_stop_reason(session_id) or "user_stop",
+                incognito=bool(rec.get("incognito")),
+            )
+        return {"stopped": stopped, "placeholder_saved": placeholder_saved}
 
     # ------------------------------------------------------------------ #
     # GET /api/chat/stream_status — check if a stream is active for a session
@@ -1482,6 +1659,9 @@ def setup_chat_routes(
         if rec is None:
             if agent_runs.is_active(session_id):
                 return {"status": "streaming", "detached": True}
+            latest = agent_run_records.latest_for_session(session_id)
+            if latest:
+                return {"status": latest.get("status") or "unknown", "detached": True, "durable": True, "run": latest}
             raise HTTPException(404, "No active stream for this session")
         return rec
 

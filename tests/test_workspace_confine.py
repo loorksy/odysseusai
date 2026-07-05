@@ -10,6 +10,7 @@ Covers: the resolver helper, the central binding (the safety net), end-to-end
 confinement of read/write/edit/grep/ls + subprocess cwd via execute_tool_block,
 the get_workspace tool, no-leak across calls, and the admin-gated browse route.
 """
+import asyncio
 import json
 import os
 import tempfile
@@ -20,6 +21,7 @@ import pytest
 from src.tool_execution import (
     _AGENT_WORKDIR,
     _active_workspace,
+    _workspace_shell_write_block_reason,
     _resolve_search_root,
     _resolve_tool_path,
     _resolve_tool_path_in_workspace,
@@ -44,8 +46,11 @@ def ws():
 @pytest.fixture
 def admin(monkeypatch):
     """Pass the public-tool gate so file tools dispatch in tests."""
-    monkeypatch.setattr(
-        "src.tool_execution.owner_is_admin_or_single_user", lambda owner: True
+    monkeypatch.setitem(execute_tool_block.__globals__, "_owner_is_admin", lambda owner: True)
+    monkeypatch.setitem(
+        execute_tool_block.__globals__,
+        "owner_is_admin_or_single_user",
+        lambda owner: True,
     )
 
 
@@ -168,6 +173,94 @@ async def test_glob_confined_e2e(ws, admin):
 
 
 @pytest.mark.asyncio
+async def test_workspace_bash_file_mutations_are_blocked(ws, admin):
+    commands = [
+        "printf 'x' > note.txt",
+        "printf 'x' >> note.txt",
+        "cat <<'EOF' > note.txt\nx\nEOF",
+        "printf 'x' | tee note.txt",
+        "cp a.txt b.txt",
+        "touch note.txt",
+        "sed -i 's/x/y/' a.txt",
+    ]
+
+    for command in commands:
+        desc, r = await execute_tool_block(_block("bash", command), owner="a", workspace=ws)
+        assert desc == "bash: BLOCKED"
+        assert r["exit_code"] == 1
+        assert "write_file" in r["error"]
+
+    assert not os.path.exists(os.path.join(ws, "note.txt"))
+    assert not os.path.exists(os.path.join(ws, "b.txt"))
+
+
+@pytest.mark.asyncio
+async def test_workspace_background_bash_file_mutation_is_blocked(ws, admin):
+    desc, r = await execute_tool_block(
+        _block("bash", "#!bg\nprintf 'x' > note.txt"),
+        session_id="s1",
+        owner="a",
+        workspace=ws,
+    )
+
+    assert desc == "bash: BLOCKED"
+    assert r["exit_code"] == 1
+    assert "write_file" in r["error"]
+    assert not os.path.exists(os.path.join(ws, "note.txt"))
+
+
+@pytest.mark.asyncio
+async def test_workspace_bash_read_only_diagnostics_remain_allowed(ws, admin):
+    desc, r = await execute_tool_block(_block("bash", "echo OK 2>/dev/null"), owner="a", workspace=ws)
+
+    assert desc != "bash: BLOCKED"
+    assert r["exit_code"] == 0
+    assert "OK" in r["output"]
+
+
+@pytest.mark.parametrize("command", [
+    "awk '$3 > 100 {print $1}' data.csv",
+    "cat data.json | jq '.items[] | select(.size > 5)'",
+    'echo "use > to redirect"',
+    "ls -la > /dev/null 2>&1",
+    "grep -rn 'a -> b' src/",
+    'python -c "print(1 > 0)"',
+    "git log --oneline | head -20",
+    "diff <(sort a.txt) <(sort b.txt)",
+])
+def test_workspace_shell_guard_allows_read_only_redirect_syntax(ws, command):
+    token = _active_workspace.set(ws)
+    try:
+        assert _workspace_shell_write_block_reason("bash", command) is None
+    finally:
+        _active_workspace.reset(token)
+
+
+@pytest.mark.parametrize("command", [
+    "printf 'x' > note.txt",
+    "printf 'x' >> note.txt",
+    "printf 'x' 1> note.txt",
+    "printf 'x' 2> error.log",
+    "printf 'x' &> out.log",
+])
+def test_workspace_shell_guard_blocks_workspace_redirect_targets(ws, command):
+    token = _active_workspace.set(ws)
+    try:
+        assert _workspace_shell_write_block_reason("bash", command)
+    finally:
+        _active_workspace.reset(token)
+
+
+def test_workspace_shell_guard_blocks_absolute_workspace_redirect_target(ws):
+    target = os.path.join(ws, "absolute-note.txt")
+    token = _active_workspace.set(ws)
+    try:
+        assert _workspace_shell_write_block_reason("bash", f"printf 'x' > {target}")
+    finally:
+        _active_workspace.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_glob_skips_sensitive_files_in_workspace(ws, admin):
     """glob must not enumerate deny-listed sensitive files that live inside the
     workspace. read_file/write_file/edit_file refuse them and grep skips them,
@@ -231,7 +324,7 @@ async def test_binding_does_not_leak(ws, admin):
 # must still surface the file tools, otherwise the agent says it has no file
 # access (the bug this guards against).
 
-def _sent_tool_names(monkeypatch, *, workspace):
+def _captured_agent_request(monkeypatch, *, workspace, prompt="look at the local project"):
     import asyncio
     import src.agent_loop as al
 
@@ -241,10 +334,11 @@ def _sent_tool_names(monkeypatch, *, workspace):
     # Isolate the selection logic from owner gating (tested separately).
     monkeypatch.setattr(al, "blocked_tools_for_owner", lambda owner: set(), raising=False)
 
-    captured = []
+    captured = {}
 
     async def _fake_stream(_candidates, messages, **kwargs):
-        captured.append(kwargs.get("tools"))
+        captured["tools"] = kwargs.get("tools")
+        captured["messages"] = messages
         yield "data: " + json.dumps({"delta": "ok"}) + "\n\n"
         yield "data: [DONE]\n\n"
 
@@ -253,14 +347,32 @@ def _sent_tool_names(monkeypatch, *, workspace):
     async def _run():
         gen = al.stream_agent_loop(
             "https://api.openai.com/v1", "gpt-test",
-            [{"role": "user", "content": "look at the local project"}],
+            [{"role": "user", "content": prompt}],
             max_rounds=1, relevant_tools=None, owner="admin", workspace=workspace,
         )
-        return [c async for c in gen]
+        captured["chunks"] = [c async for c in gen]
 
     asyncio.run(_run())
-    schemas = captured[0] or []
+    return captured
+
+
+def _sent_tool_names(monkeypatch, *, workspace, prompt="look at the local project"):
+    captured = _captured_agent_request(monkeypatch, workspace=workspace, prompt=prompt)
+    schemas = captured["tools"] or []
     return {t["function"]["name"] for t in schemas if isinstance(t, dict) and "function" in t}
+
+
+def _events_from_chunks(chunks):
+    events = []
+    for chunk in chunks:
+        for line in str(chunk).splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                continue
+            events.append(json.loads(payload))
+    return events
 
 
 def test_low_signal_with_workspace_surfaces_readonly_file_tools(monkeypatch):
@@ -280,6 +392,204 @@ def test_low_signal_without_workspace_excludes_file_tools(monkeypatch):
     names = _sent_tool_names(monkeypatch, workspace=None)
     assert "read_file" not in names
     assert "get_workspace" not in names
+
+
+def test_workspace_copy_request_surfaces_write_file_tools(monkeypatch):
+    names = _sent_tool_names(
+        monkeypatch,
+        workspace="/tmp",
+        prompt="Copy README.txt to README_copy.txt and add a final line",
+    )
+
+    assert "get_workspace" in names
+    assert "read_file" in names
+    assert "write_file" in names
+    assert "edit_file" in names
+
+
+def test_workspace_readme_append_request_surfaces_write_file_tools(monkeypatch):
+    names = _sent_tool_names(
+        monkeypatch,
+        workspace="/tmp",
+        prompt="Append 'This is a test' to the README",
+    )
+
+    assert "read_file" in names
+    assert "write_file" in names
+    assert "edit_file" in names
+
+
+def test_workspace_contract_prompt_is_injected(monkeypatch):
+    captured = _captured_agent_request(monkeypatch, workspace="/tmp/project")
+    messages = captured["messages"]
+    contract = next(
+        (m for m in messages if "ACTIVE WORKSPACE CONTRACT" in (m.get("content") or "")),
+        None,
+    )
+    assert contract is not None
+    assert contract["role"] == "system"
+    assert contract.get("_protected") is None  # stripped before provider call
+    assert "/tmp/project" in contract["content"]
+    assert "write_file" in contract["content"]
+    assert "verify the artifact" in contract["content"]
+    assert "Do not say you lack permission" in contract["content"]
+
+
+def test_workspace_contract_includes_configured_label(monkeypatch):
+    import src.agent_loop as al
+
+    monkeypatch.setenv("ODYSSEUS_DEFAULT_WORKSPACE", "/workspace")
+    monkeypatch.setenv("ODYSSEUS_WORKSPACE_LABEL", r"D:\Odysseus_Workspace")
+    captured = _captured_agent_request(monkeypatch, workspace="/workspace")
+    messages = captured["messages"]
+    contract = next(
+        (m for m in messages if "ACTIVE WORKSPACE CONTRACT" in (m.get("content") or "")),
+        None,
+    )
+
+    assert contract is not None
+    assert r"D:\Odysseus_Workspace (mounted as /workspace)" in contract["content"]
+    assert "same workspace" in contract["content"]
+    assert al._workspace_display_label("/workspace") == r"D:\Odysseus_Workspace (mounted as /workspace)"
+
+
+def test_agent_limits_include_workspace_label(monkeypatch):
+    monkeypatch.setenv("ODYSSEUS_DEFAULT_WORKSPACE", "/workspace")
+    monkeypatch.setenv("ODYSSEUS_WORKSPACE_LABEL", r"D:\Odysseus_Workspace")
+    captured = _captured_agent_request(monkeypatch, workspace="/workspace")
+    metrics = next(
+        e["data"] for e in _events_from_chunks(captured["chunks"])
+        if e.get("type") == "metrics"
+    )
+
+    limits = metrics["agent_limits"]
+    assert limits["workspace_bound"] is True
+    assert limits["workspace_path"] == "/workspace"
+    assert limits["workspace_label"] == r"D:\Odysseus_Workspace (mounted as /workspace)"
+
+
+def test_blocked_workspace_shell_write_forces_file_tool_recovery(monkeypatch):
+    import src.agent_loop as al
+
+    monkeypatch.setattr(al, "get_setting", lambda key, default=None: default, raising=False)
+    monkeypatch.setattr(al, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(al, "estimate_tokens", lambda *a, **k: 10, raising=False)
+    monkeypatch.setattr(al, "blocked_tools_for_owner", lambda owner: set(), raising=False)
+
+    calls = []
+    stream_rounds = []
+
+    async def _fake_stream(_candidates, messages, **kwargs):
+        stream_rounds.append(messages)
+        round_idx = len(stream_rounds)
+        if round_idx == 1:
+            text = (
+                "```bash\n"
+                "cp README.txt agent-smoke-copy-20260619.txt\n"
+                "printf 'Agent smoke test copy\\n' >> agent-smoke-copy-20260619.txt\n"
+                "```"
+            )
+        elif round_idx == 2:
+            text = (
+                "I can do this via the workspace file tools immediately.\n\n"
+                "I'll read `README.txt`, write the copy, append the line, and verify it."
+            )
+        elif round_idx == 3:
+            text = (
+                "```read_file\nREADME.txt\n```\n"
+                "```write_file\n"
+                "agent-smoke-copy-20260619.txt\n"
+                "README text\n\nAgent smoke test copy\n"
+                "```"
+            )
+        else:
+            text = "Created and verified `agent-smoke-copy-20260619.txt`."
+        yield "data: " + json.dumps({"delta": text}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def _fake_exec(block, *args, **kwargs):
+        calls.append(block.tool_type)
+        if block.tool_type == "bash":
+            return ("bash: BLOCKED", {
+                "error": (
+                    "Workspace file changes must use `write_file` for creates/full rewrites "
+                    "or `edit_file` for targeted edits. Shell is still available for "
+                    "read-only diagnostics, but redirection/heredocs/tee/cp/mv/touch/"
+                    "in-place edits are blocked while a workspace is active."
+                ),
+                "exit_code": 1,
+            })
+        if block.tool_type == "read_file":
+            return ("read_file: README.txt", {
+                "output": "README text",
+                "exit_code": 0,
+            })
+        if block.tool_type == "write_file":
+            return ("write_file: agent-smoke-copy-20260619.txt", {
+                "output": "Wrote 34 bytes to /workspace/agent-smoke-copy-20260619.txt",
+                "exit_code": 0,
+                "diff": {
+                    "file": "agent-smoke-copy-20260619.txt",
+                    "text": "+README text\n+\n+Agent smoke test copy",
+                    "new_file": True,
+                },
+            })
+        raise AssertionError(f"unexpected tool call: {block.tool_type}")
+
+    monkeypatch.setattr(al, "stream_llm_with_fallback", _fake_stream, raising=False)
+    monkeypatch.setattr(al, "execute_tool_block", _fake_exec, raising=False)
+
+    async def _run():
+        gen = al.stream_agent_loop(
+            "http://local.test/v1",
+            "local-model",
+            [{"role": "user", "content": (
+                "Copy README.txt to agent-smoke-copy-20260619.txt in the mounted "
+                "workspace, then append a final line that says \"Agent smoke test copy\". "
+                "Verify by reading the new file before answering."
+            )}],
+            max_rounds=4,
+            relevant_tools={"bash", "read_file", "write_file", "edit_file", "get_workspace"},
+            owner="admin",
+            workspace="/workspace",
+        )
+        return [chunk async for chunk in gen]
+
+    events = _events_from_chunks(asyncio.run(_run()))
+
+    assert calls == ["bash", "read_file", "write_file"]
+    assert len(stream_rounds) == 4
+    assert any(event.get("type") == "agent_step" and event.get("round") == 3 for event in events)
+    assert any(
+        event.get("type") == "agent_process"
+        and "I'll read `README.txt`" in event.get("text", "")
+        for event in events
+    )
+    assert not any(
+        event.get("type") == "agent_final"
+        and "I'll read `README.txt`" in event.get("text", "")
+        for event in events
+    )
+    metrics = next(event["data"] for event in events if event.get("type") == "metrics")
+    recovery = metrics["agent_workspace_shell_write_recovery"]
+    assert recovery["blocked_shell_write"] is True
+    assert recovery["nudges"] == 1
+    assert recovery["pending"] is False
+
+
+def test_final_answer_contract_prompt_is_injected(monkeypatch):
+    captured = _captured_agent_request(monkeypatch, workspace=None)
+    messages = captured["messages"]
+    contract = next(
+        (m for m in messages if "FINAL ANSWER CONTRACT" in (m.get("content") or "")),
+        None,
+    )
+
+    assert contract is not None
+    assert contract["role"] == "system"
+    assert contract.get("_protected") is None
+    assert "Keep the final answer concise" in contract["content"]
+    assert "Do not replay tool commands" in contract["content"]
 
 
 # ── browse route is admin-gated ─────────────────────────────────────────
@@ -380,8 +690,43 @@ def test_request_workspace_gate(ws, monkeypatch):
     # drop silently, and the path never reaches the filesystem.
     assert cr._resolve_request_workspace(object(), ws) == ("", "")
     assert cr._resolve_request_workspace(object(), "/nonexistent/xyz") == ("", "")
+    assert cr._resolve_request_workspace(object(), "") == ("", "")
     assert vet_calls == []
 
     monkeypatch.setattr(ts, "owner_is_admin_or_single_user", lambda owner: True)
     assert cr._resolve_request_workspace(object(), ws) == (os.path.realpath(ws), "")
     assert cr._resolve_request_workspace(object(), "/nonexistent/xyz") == ("", "/nonexistent/xyz")
+
+
+def test_request_workspace_defaults_to_mounted_workspace(monkeypatch, ws):
+    """A missing workspace form value should still bind the standard Docker
+    workspace mount when it is present and the caller is allowed to use it."""
+    import routes.chat_routes as cr
+
+    monkeypatch.setattr(cr, "get_current_user", lambda req: "admin")
+
+    import src.tool_security as ts
+    monkeypatch.setattr(ts, "owner_is_admin_or_single_user", lambda owner: True)
+    monkeypatch.setattr(cr, "_DEFAULT_MOUNTED_WORKSPACE", "/workspace")
+    monkeypatch.setattr(cr.os.path, "isdir", lambda path: path == "/workspace")
+
+    import src.tool_execution as te
+    monkeypatch.setattr(te, "vet_workspace", lambda path: ws if path == "/workspace" else None)
+
+    assert cr._resolve_request_workspace(object(), "") == (ws, "")
+    assert cr._resolve_request_workspace(object(), None) == (ws, "")
+
+
+def test_request_workspace_default_is_not_rejected_when_missing(monkeypatch):
+    """If the conventional mount is absent, omission just means no workspace;
+    no workspace_rejected event should be emitted for an implicit default."""
+    import routes.chat_routes as cr
+
+    monkeypatch.setattr(cr, "get_current_user", lambda req: "admin")
+
+    import src.tool_security as ts
+    monkeypatch.setattr(ts, "owner_is_admin_or_single_user", lambda owner: True)
+    monkeypatch.setattr(cr, "_DEFAULT_MOUNTED_WORKSPACE", "/workspace")
+    monkeypatch.setattr(cr.os.path, "isdir", lambda path: False)
+
+    assert cr._resolve_request_workspace(object(), "") == ("", "")

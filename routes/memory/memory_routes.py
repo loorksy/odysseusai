@@ -356,7 +356,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 )
         else:
             endpoint_url, model, headers = resolve_task_endpoint(owner=user)
-    
+
         if not endpoint_url or not model:
             raise HTTPException(400, "No LLM model configured. Set a default model in Settings.")
 

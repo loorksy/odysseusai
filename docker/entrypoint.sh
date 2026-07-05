@@ -100,6 +100,15 @@ for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
     repair_bind_mount_ownership "$dir"
 done
 
+if [ "${ODYSSEUS_CHOWN_BIND_RECURSIVE:-0}" = "1" ]; then
+    for dir in /app/data /app/logs /app/.ssh; do
+        if [ -d "$dir" ]; then
+            find "$dir" -not -uid "$PUID" -print0 2>/dev/null \
+                | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
+        fi
+    done
+fi
+
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or
 # symlink /usr/local/cuda. vllm 0.22+ then crashes during engine init

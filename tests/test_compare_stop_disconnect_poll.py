@@ -24,10 +24,97 @@ normal completed streams, and non-interference with detached chat/agent
 streams that are meant to keep running server-side after a client disconnect.
 """
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from src import agent_runs
+from routes.chat_routes import _save_cancelled_stream_placeholder
+
+
+class _PlaceholderSession:
+    def __init__(self, model="selected-model"):
+        self.model = model
+        self.history = []
+
+    def add_message(self, message):
+        self.history.append(message)
+
+
+class _PlaceholderSessionManager:
+    def __init__(self, session):
+        self.session = session
+        self.saved = 0
+
+    def get_session(self, session_id):
+        assert session_id == "sess-stop-placeholder"
+        return self.session
+
+    def save_sessions(self):
+        self.saved += 1
+
+
+def test_cancelled_placeholder_is_saved_once_for_empty_explicit_stop():
+    session = _PlaceholderSession()
+    manager = _PlaceholderSessionManager(session)
+
+    saved = _save_cancelled_stream_placeholder(
+        manager,
+        "sess-stop-placeholder",
+        model="actual-model",
+        requested_model="requested-model",
+    )
+
+    assert saved is True
+    assert manager.saved == 1
+    assert len(session.history) == 1
+    msg = session.history[-1]
+    assert msg.role == "assistant"
+    assert msg.content == ""
+    assert msg.metadata["stopped"] is True
+    assert msg.metadata["cancelled"] is True
+    assert msg.metadata["stop_reason"] == "user_stop"
+    assert msg.metadata["model"] == "actual-model"
+    assert msg.metadata["requested_model"] == "requested-model"
+
+    assert _save_cancelled_stream_placeholder(manager, "sess-stop-placeholder") is False
+    assert manager.saved == 1
+    assert len(session.history) == 1
+
+
+def test_cancelled_placeholder_is_not_saved_for_incognito():
+    session = _PlaceholderSession()
+    manager = _PlaceholderSessionManager(session)
+
+    saved = _save_cancelled_stream_placeholder(
+        manager,
+        "sess-stop-placeholder",
+        incognito=True,
+    )
+
+    assert saved is False
+    assert manager.saved == 0
+    assert session.history == []
+
+
+def test_timeout_placeholder_is_not_marked_user_cancelled():
+    session = _PlaceholderSession()
+    manager = _PlaceholderSessionManager(session)
+
+    saved = _save_cancelled_stream_placeholder(
+        manager,
+        "sess-stop-placeholder",
+        stop_reason="idle_timeout",
+    )
+
+    assert saved is True
+    msg = session.history[-1]
+    assert msg.role == "assistant"
+    assert msg.content == ""
+    assert msg.metadata["stopped"] is True
+    assert msg.metadata["cancelled"] is False
+    assert msg.metadata["timed_out"] is True
+    assert msg.metadata["stop_reason"] == "idle_timeout"
 
 
 # --------------------------------------------------------------------------- #
@@ -165,6 +252,57 @@ async def test_normal_completion_saves_exactly_once_not_partial():
     assert sink.saves == []
 
 
+@pytest.mark.asyncio
+async def test_idle_watchdog_stops_silent_detached_run(monkeypatch):
+    """A detached run that produces no progress is cancelled by the watchdog."""
+    monkeypatch.setattr(agent_runs, "_WATCHDOG_POLL_S", 0.01)
+    monkeypatch.setattr(agent_runs, "_AGENT_RUN_IDLE_TIMEOUT_S", 0.03)
+    monkeypatch.setattr(agent_runs, "_AGENT_RUN_MAX_WALL_S", 0)
+
+    async def _hang_forever():
+        await asyncio.Event().wait()
+        yield "data: never\n\n"
+
+    session_id = "sess-detached-idle-watchdog"
+    agent_runs._RUNS.pop(session_id, None)
+    run = agent_runs.start(session_id, _hang_forever())
+
+    try:
+        await asyncio.wait_for(run.task, timeout=1)
+        assert run.status == "stopped"
+        assert run.stop_reason == "idle_timeout"
+        assert any("run_timeout" in ev and "idle_timeout" in ev for ev in run.buffer)
+    finally:
+        agent_runs._RUNS.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_watchdog_stops_active_detached_run(monkeypatch):
+    """Wall-clock limits still stop a run that is actively streaming progress."""
+    monkeypatch.setattr(agent_runs, "_WATCHDOG_POLL_S", 0.01)
+    monkeypatch.setattr(agent_runs, "_AGENT_RUN_IDLE_TIMEOUT_S", 10)
+    monkeypatch.setattr(agent_runs, "_AGENT_RUN_MAX_WALL_S", 0.04)
+
+    async def _progress_forever():
+        i = 0
+        while True:
+            await asyncio.sleep(0.005)
+            yield f"data: progress-{i}\n\n"
+            i += 1
+
+    session_id = "sess-detached-wall-watchdog"
+    agent_runs._RUNS.pop(session_id, None)
+    run = agent_runs.start(session_id, _progress_forever())
+
+    try:
+        await asyncio.wait_for(run.task, timeout=1)
+        assert run.status == "stopped"
+        assert run.stop_reason == "wall_clock_timeout"
+        assert any("run_timeout" in ev and "wall_clock_timeout" in ev for ev in run.buffer)
+    finally:
+        agent_runs._RUNS.pop(session_id, None)
+
+
 # --------------------------------------------------------------------------- #
 # chat_stream: Compare panes must NOT be detached, so the Stop button (closing
 # the SSE) cancels the upstream generator promptly — exercising the same
@@ -277,14 +415,65 @@ def test_compare_mode_branch_skips_agent_runs_in_source():
     (bypassing agent_runs.start/subscribe) BEFORE the detached agent_runs.start
     call below it — otherwise compare streams would still be detached and a
     pane's Stop (closing the SSE) wouldn't cancel the upstream call."""
-    from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "routes" / "chat_routes.py").read_text(encoding="utf-8")
 
     branch_idx = src.index("if compare_mode:")
     direct_return_idx = src.index("return StreamingResponse(_safe_stream(), media_type=", branch_idx)
-    detach_idx = src.index("agent_runs.start(session, _safe_stream())", branch_idx)
+    detach_idx = src.index("agent_runs.start(session, _safe_stream(), record_id=_run_record_id)", branch_idx)
 
     assert branch_idx < direct_return_idx < detach_idx, (
         "compare_mode must short-circuit to a direct (non-detached) "
         "StreamingResponse before normal streams are wrapped in agent_runs"
     )
+
+
+def test_empty_cancelled_bubble_uses_server_stop_persistence():
+    src = (Path(__file__).resolve().parents[1] / "static" / "js" / "chat.js").read_text(encoding="utf-8")
+
+    fn_idx = src.index("function _renderCancelledBubble(holder)")
+    next_fn_idx = src.index("  /**\n   * Detach current stream", fn_idx)
+    fn_src = src[fn_idx:next_fn_idx]
+
+    assert "/api/chat/stop/" in src
+    assert "inject_messages" not in fn_src
+    assert "Persistence is handled by POST /api/chat/stop/{session_id}" in fn_src
+
+
+def test_timeout_stopped_bubble_does_not_offer_continue():
+    src = (Path(__file__).resolve().parents[1] / "static" / "js" / "chatRenderer.js").read_text(encoding="utf-8")
+
+    assert "metadata.stop_reason === 'idle_timeout'" in src
+    assert "metadata.stop_reason === 'wall_clock_timeout'" in src
+    assert "[Agent stopped after timeout]" in src
+    assert "if (!metadata.cancelled && !timedOut && !lostAfterRestart && !runFailed)" in src
+
+
+def test_stopped_agent_placeholder_hides_process_as_final_answer():
+    renderer = (Path(__file__).resolve().parents[1] / "static" / "js" / "chatRenderer.js").read_text(encoding="utf-8")
+    routes = (Path(__file__).resolve().parents[1] / "routes" / "chat_routes.py").read_text(encoding="utf-8")
+
+    assert "prepare_stopped_agent_response_for_save" in routes
+    assert "_agent_round_texts.append" in routes
+    assert "_agent_tool_events.append" in routes
+    assert "_agent_final_text = str(data.get(\"text\") or \"\")" in routes
+    assert "metadata?.agent_stopped_before_final) return ''" in renderer
+    assert "metadata?.agent_stopped_before_final && !metadata?.agent_final_response" in renderer
+    assert "[Agent stopped before final answer]" in renderer
+    assert "hasCapturedAgentProcess" in renderer
+    assert "No tool actions were captured before the stop." in renderer
+    assert "Continue the interrupted agent task from the existing process state" in renderer
+
+
+def test_durable_terminal_run_status_renders_on_session_reload():
+    sessions = (Path(__file__).resolve().parents[1] / "static" / "js" / "sessions.js").read_text(encoding="utf-8")
+    renderer = (Path(__file__).resolve().parents[1] / "static" / "js" / "chatRenderer.js").read_text(encoding="utf-8")
+
+    assert "_renderDurableTerminalRun(sessionId, info)" in sessions
+    assert "if (info.status !== 'streaming')" in sessions
+    assert "_hasAssistantAfterLastUser()" in sessions
+    assert "durable_run_id" in sessions
+    assert "chatRenderer.addMessage('assistant', '', model, metadata)" in sessions
+    assert "metadata.run_status === 'lost_after_restart'" in renderer
+    assert "[Agent stopped after server restart]" in renderer
+    assert "[Agent run failed]" in renderer
+    assert "!lostAfterRestart && !runFailed" in renderer

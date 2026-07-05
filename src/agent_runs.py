@@ -17,13 +17,21 @@ close / navigation / refresh). It does NOT survive a server restart.
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Dict, Optional
+import os
+import time
+from typing import Any, AsyncGenerator, Dict, Optional
+
+from src import agent_run_records
 
 logger = logging.getLogger(__name__)
 
 
 class _Run:
-    __slots__ = ("buffer", "subscribers", "status", "task", "evict_task")
+    __slots__ = (
+        "buffer", "subscribers", "status", "task", "evict_task",
+        "watchdog_task", "started_at", "last_event_at", "stop_reason",
+        "record_id", "error",
+    )
 
     def __init__(self) -> None:
         self.buffer: list = []          # ordered SSE event strings (replay log)
@@ -31,6 +39,13 @@ class _Run:
         self.status: str = "running"    # running | done | error | stopped
         self.task: Optional[asyncio.Task] = None
         self.evict_task: Optional[asyncio.Task] = None
+        self.watchdog_task: Optional[asyncio.Task] = None
+        now = time.monotonic()
+        self.started_at: float = now
+        self.last_event_at: float = now
+        self.stop_reason: str = ""
+        self.record_id: str = ""
+        self.error: str = ""
 
 
 _RUNS: Dict[str, _Run] = {}
@@ -40,10 +55,25 @@ _RUNS: Dict[str, _Run] = {}
 # replay the result. After this, the run is evicted to bound memory — without
 # it, every session that ever streamed kept its entire event log forever.
 _EVICT_GRACE_S = 180
+_WATCHDOG_POLL_S = 5.0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# 0 disables either cap. Long-running tools normally emit progress heartbeats,
+# so the idle timeout catches silent/wedged streams while allowing active work.
+_AGENT_RUN_MAX_WALL_S = _env_int("ODYSSEUS_AGENT_RUN_MAX_WALL_SECONDS", 7200)
+_AGENT_RUN_IDLE_TIMEOUT_S = _env_int("ODYSSEUS_AGENT_RUN_IDLE_TIMEOUT_SECONDS", 900)
 
 
 def _publish(run: _Run, ev: str) -> None:
     """Append one SSE event and fan it out to every live subscriber."""
+    run.last_event_at = time.monotonic()
     run.buffer.append(ev)
     seq = len(run.buffer) - 1
     for q in list(run.subscribers):
@@ -51,6 +81,76 @@ def _publish(run: _Run, ev: str) -> None:
             q.put_nowait((seq, ev))
         except Exception:
             pass
+
+
+def _last_event_type(ev: str) -> str:
+    if not ev:
+        return ""
+    if ev.startswith("event: "):
+        return ev.splitlines()[0].replace("event:", "", 1).strip()
+    if ev.strip() == "data: [DONE]":
+        return "done"
+    if ev.startswith("data: "):
+        payload = ev[6:].strip()
+        try:
+            data = json.loads(payload)
+        except Exception:
+            return "data"
+        if isinstance(data, dict):
+            if data.get("type"):
+                return str(data.get("type"))
+            if "delta" in data:
+                return "delta"
+        return "data"
+    return ""
+
+
+def _json_data_event(ev: str) -> Optional[Dict[str, Any]]:
+    """Return the JSON object carried by an SSE data event, if any."""
+    data_lines = []
+    for line in (ev or "").splitlines():
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+    if not data_lines:
+        return None
+    payload = "\n".join(data_lines).strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _durable_finish_fields(buffer: list) -> Dict[str, Any]:
+    """Derive durable lifecycle fields from the real detached SSE stream."""
+    assistant_message_id = ""
+    delta_chars = 0
+    last_agent_final = ""
+
+    for ev in buffer:
+        data = _json_data_event(ev)
+        if not data:
+            continue
+
+        if data.get("type") == "message_saved" and data.get("id"):
+            assistant_message_id = str(data.get("id"))
+
+        if "delta" in data:
+            if not data.get("thinking"):
+                delta_chars += len(str(data.get("delta") or ""))
+            continue
+
+        if data.get("type") == "agent_final" and isinstance(data.get("text"), str):
+            last_agent_final = data["text"]
+
+    fields: Dict[str, Any] = {
+        "partial_chars": delta_chars if delta_chars else len(last_agent_final),
+    }
+    if assistant_message_id:
+        fields["assistant_message_id"] = assistant_message_id
+    return fields
 
 
 def _schedule_evict(session_id: str) -> None:
@@ -75,6 +175,49 @@ def _schedule_evict(session_id: str) -> None:
     run.evict_task = asyncio.create_task(_evict(run))
 
 
+async def _watchdog(session_id: str, run_ref: _Run) -> None:
+    """Cancel a detached run that exceeds wall-clock or no-progress limits."""
+    while True:
+        try:
+            await asyncio.sleep(_WATCHDOG_POLL_S)
+        except asyncio.CancelledError:
+            return
+        cur = _RUNS.get(session_id)
+        if cur is not run_ref or cur.status != "running":
+            return
+
+        now = time.monotonic()
+        reason = ""
+        if _AGENT_RUN_MAX_WALL_S > 0 and (now - cur.started_at) >= _AGENT_RUN_MAX_WALL_S:
+            reason = "wall_clock_timeout"
+        elif _AGENT_RUN_IDLE_TIMEOUT_S > 0 and (now - cur.last_event_at) >= _AGENT_RUN_IDLE_TIMEOUT_S:
+            reason = "idle_timeout"
+        if not reason:
+            continue
+
+        cur.stop_reason = reason
+        logger.warning("[agent-run] %s stopped by %s watchdog", session_id, reason)
+        _publish(
+            cur,
+            "data: "
+            + json.dumps({
+                "type": "run_timeout",
+                "reason": reason,
+                "message": (
+                    "Agent run stopped by the server watchdog after exceeding "
+                    "the wall-clock limit." if reason == "wall_clock_timeout"
+                    else "Agent run stopped by the server watchdog after no stream progress."
+                ),
+                "wall_seconds": round(now - cur.started_at, 3),
+                "idle_seconds": round(now - cur.last_event_at, 3),
+            })
+            + "\n\n",
+        )
+        if cur.task and not cur.task.done():
+            cur.task.cancel()
+        return
+
+
 def is_active(session_id: str) -> bool:
     r = _RUNS.get(session_id)
     return bool(r and r.status == "running")
@@ -83,6 +226,11 @@ def is_active(session_id: str) -> bool:
 def get_status(session_id: str) -> Optional[str]:
     r = _RUNS.get(session_id)
     return r.status if r else None
+
+
+def get_stop_reason(session_id: str) -> str:
+    r = _RUNS.get(session_id)
+    return r.stop_reason if r else ""
 
 
 async def _drain(session_id: str, agen: AsyncGenerator[str, None],
@@ -119,6 +267,8 @@ async def _drain(session_id: str, agen: AsyncGenerator[str, None],
     except Exception as e:
         logger.error("[agent-run] %s failed: %s", session_id, e, exc_info=True)
         run.status = "error"
+        run.stop_reason = "error"
+        run.error = str(e)
         _publish(
             run,
             "event: error\n"
@@ -126,6 +276,19 @@ async def _drain(session_id: str, agen: AsyncGenerator[str, None],
         )
         _publish(run, "data: [DONE]\n\n")
     finally:
+        if run.record_id:
+            finish_fields = _durable_finish_fields(run.buffer)
+            agent_run_records.finish(
+                run.record_id,
+                status=run.status,
+                stop_reason=run.stop_reason,
+                error=run.error,
+                event_count=len(run.buffer),
+                last_event_type=_last_event_type(run.buffer[-1]) if run.buffer else "",
+                **finish_fields,
+            )
+        if run.watchdog_task and not run.watchdog_task.done():
+            run.watchdog_task.cancel()
         # Wake every subscriber with the end sentinel so their SSE closes.
         for q in list(run.subscribers):
             try:
@@ -138,20 +301,25 @@ async def _drain(session_id: str, agen: AsyncGenerator[str, None],
         _schedule_evict(session_id)
 
 
-def start(session_id: str, agen: AsyncGenerator[str, None]) -> _Run:
+def start(session_id: str, agen: AsyncGenerator[str, None], *, record_id: str = "") -> _Run:
     """Start a detached run draining `agen` for a session. If a run is already in
     flight for this session (e.g. a rapid double-send), it's cancelled first."""
     prev = _RUNS.get(session_id)
     prev_task: Optional[asyncio.Task] = None
     if prev:
         if prev.task and not prev.task.done():
+            prev.stop_reason = "replaced"
             prev.task.cancel()
             prev_task = prev.task   # new run awaits this before it starts writing
         if prev.evict_task and not prev.evict_task.done():
             prev.evict_task.cancel()
+        if prev.watchdog_task and not prev.watchdog_task.done():
+            prev.watchdog_task.cancel()
     run = _Run()
+    run.record_id = record_id or ""
     _RUNS[session_id] = run
     run.task = asyncio.create_task(_drain(session_id, agen, prev_task))
+    run.watchdog_task = asyncio.create_task(_watchdog(session_id, run))
     return run
 
 
@@ -208,6 +376,7 @@ def stop(session_id: str) -> bool:
     """Cancel an in-flight run (the wrapped generator saves its partial)."""
     run = _RUNS.get(session_id)
     if run and run.task and not run.task.done():
+        run.stop_reason = "user_stop"
         run.task.cancel()
         return True
     return False

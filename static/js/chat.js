@@ -1671,7 +1671,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 typewriterInto(roundHolder.querySelector('.body'), errMsg);
                 break;
               }
-              if (json.delta || json.type === 'agent_prep' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
+              if (json.delta || json.type === 'agent_prep' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'agent_process' || json.type === 'agent_final' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
                 clearResponseTimeout();
                 clearProcessingProbe();
                 clearFirstTokenWaitTimers();
@@ -1951,6 +1951,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   // Feed streaming TTS with accumulated text
                   if (streamingTTS) window.aiTTSManager.streamingUpdate(roundText);
                 }
+              } else if (json.type === 'agent_process') {
+                if (_isBg) continue;
+                if (!holder._agentProcessTexts) holder._agentProcessTexts = [];
+                holder._agentProcessTexts.push(json.text || '');
+              } else if (json.type === 'agent_final') {
+                if (_isBg) continue;
+                holder._agentFinalText = json.text || '';
               } else if (json.type === 'research_progress') {
                 if (_isBg) continue; // Skip DOM updates in background
                 _researchingStreamIds.add(streamSessionId);
@@ -2922,7 +2929,18 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         }
 
         // Attach footer to the last visible bubble (roundHolder for multi-round agent, holder for single)
-        const footerTarget = (roundHolder && roundHolder !== holder && roundHolder.style.display !== 'none') ? roundHolder : holder;
+        let footerTarget = (roundHolder && roundHolder !== holder && roundHolder.style.display !== 'none') ? roundHolder : holder;
+        if (metrics && holder._agentFinalText && !metrics.agent_final_response) {
+          metrics.agent_final_response = holder._agentFinalText;
+        }
+        if (metrics && holder._agentProcessTexts?.length && !Array.isArray(metrics.round_texts)) {
+          metrics.round_texts = holder._agentFinalText
+            ? holder._agentProcessTexts.concat([holder._agentFinalText])
+            : holder._agentProcessTexts.slice();
+        }
+        if (metrics?.tool_events?.length && chatRenderer.collapseAgentProcessAfterStream) {
+          footerTarget = chatRenderer.collapseAgentProcessAfterStream(holder, footerTarget, metrics, modelName) || footerTarget;
+        }
         if (!footerTarget.querySelector('.msg-footer')) {
           footerTarget.appendChild(createMsgFooter(footerTarget));
         }
@@ -2931,13 +2949,16 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           _appendViewReportLink(footerTarget, streamSessionId);
         }
         // Also store raw on the footer target so copy/TTS work
-        if (footerTarget !== holder) footerTarget.dataset.raw = accumulated;
-        if (addAITTSButton && accumulated && window.aiTTSManager?._provider !== 'disabled' && window.aiTTSManager?.available) {
-          addAITTSButton(footerTarget, accumulated);
+        const _actionText = (metrics?.tool_events?.length && chatRenderer.getAgentFinalResponse)
+          ? (chatRenderer.getAgentFinalResponse(accumulated, metrics) || accumulated)
+          : accumulated;
+        if (footerTarget !== holder) footerTarget.dataset.raw = _actionText;
+        if (addAITTSButton && _actionText && window.aiTTSManager?._provider !== 'disabled' && window.aiTTSManager?.available) {
+          addAITTSButton(footerTarget, _actionText);
         }
         // TTS auto-play: streaming mode flushes remaining text, non-streaming enqueues full message
-        if (accumulated && window.aiTTSManager && window.aiTTSManager.autoPlay) {
-          const ttsBtn = holder.querySelector('.ai-tts-button');
+        if (_actionText && window.aiTTSManager && window.aiTTSManager.autoPlay) {
+          const ttsBtn = footerTarget.querySelector('.ai-tts-button');
           if (ttsBtn) {
             var ICON_PLAY_TTS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
             var ICON_STOP_TTS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
@@ -2960,7 +2981,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
               }
             } else {
               // Non-streaming fallback (autoPlay toggled mid-stream, etc.)
-              window.aiTTSManager.enqueue(accumulated, ttsBtn, resetFn);
+              window.aiTTSManager.enqueue(_actionText, ttsBtn, resetFn);
             }
           }
         }
@@ -3431,33 +3452,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     if (typeof createMsgFooter === 'function' && !holder.querySelector('.msg-footer')) {
       holder.appendChild(createMsgFooter(holder));
     }
-    // Persist as an assistant message with stopped+cancelled metadata so the
-    // chat-history loader renders the same indicator after a refresh.
-    // Include the model name so the bubble header still shows which model
-    // was running when the user hit Stop.
-    const sid = sessionModule.getCurrentSessionId();
-    if (sid) {
-      let modelName = '';
-      try { modelName = sessionModule.getCurrentModel?.() || ''; } catch {}
-      // Fallback: pull from the holder's existing meta (the streaming
-      // placeholder usually has the model set in the header already).
-      if (!modelName) {
-        modelName = holder.dataset.model
-          || holder.querySelector('.msg-header .msg-model')?.textContent
-          || '';
-      }
-      fetch(`${API_BASE}/api/session/${sid}/inject_messages`, {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: [{
-            role: 'assistant',
-            content: '',
-            metadata: { stopped: true, cancelled: true, model: modelName },
-          }],
-        }),
-      }).catch(() => {});
-    }
+    // Persistence is handled by POST /api/chat/stop/{session_id}. Keeping the
+    // save server-side prevents an early Stop from vanishing after refresh
+    // while avoiding duplicate empty assistant rows from the browser.
   }
 
   /**

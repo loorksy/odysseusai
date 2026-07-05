@@ -208,6 +208,43 @@ class ChatMessage(Base):
         Index('ix_messages_session_time', 'session_id', 'timestamp'),  # Composite for efficient message retrieval
     )
 
+
+class AgentRunRecord(Base):
+    """Durable lifecycle record for a detached chat/agent stream."""
+    __tablename__ = "agent_run_records"
+
+    id = Column(String, primary_key=True, index=True)
+    session_id = Column(String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_message_id = Column(String, nullable=True, index=True)
+    assistant_message_id = Column(String, nullable=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+
+    status = Column(String, nullable=False, default="running")
+    mode = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    requested_model = Column(String, nullable=True)
+    workspace_path = Column(String, nullable=True)
+    workspace_label = Column(String, nullable=True)
+
+    started_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    updated_at = Column(DateTime, nullable=False, default=utcnow_naive, onupdate=utcnow_naive)
+    finished_at = Column(DateTime, nullable=True)
+    stop_reason = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    event_count = Column(Integer, default=0)
+    partial_chars = Column(Integer, default=0)
+    last_event_type = Column(String, nullable=True)
+
+    session = relationship("Session", backref=backref(
+        "agent_run_records",
+        cascade="all, delete-orphan",
+    ))
+
+    __table_args__ = (
+        Index("ix_agent_run_records_session_status", "session_id", "status", "started_at"),
+        Index("ix_agent_run_records_owner_status", "owner", "status", "started_at"),
+    )
+
 class Document(TimestampMixin, Base):
     """Living document that the AI can create and edit in-place."""
     __tablename__ = "documents"
@@ -405,6 +442,7 @@ class ProviderAuthSession(TimestampMixin, Base):
     base_url = Column(String, nullable=False)
     access_token = Column(EncryptedText, nullable=True)
     refresh_token = Column(EncryptedText, nullable=True)
+    chatgpt_account_id = Column(EncryptedText, nullable=True)
     last_refresh = Column(DateTime, nullable=True)
     auth_mode = Column(String, nullable=True)
 
@@ -895,6 +933,30 @@ def _migrate_add_provider_auth_id_column():
             logging.getLogger(__name__).info("Migrated: added 'provider_auth_id' column + index to model_endpoints")
     except Exception as e:
         logging.getLogger(__name__).warning(f"model_endpoints.provider_auth_id migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_add_provider_auth_session_account_id_column():
+    """Add ChatGPT account metadata to provider_auth_sessions if missing."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(provider_auth_sessions)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "chatgpt_account_id" not in columns:
+            conn.execute("ALTER TABLE provider_auth_sessions ADD COLUMN chatgpt_account_id TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'chatgpt_account_id' column to provider_auth_sessions")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"provider_auth_sessions.chatgpt_account_id migration failed: {e}")
     finally:
         try:
             conn.close()
@@ -1827,6 +1889,7 @@ def init_db():
     _migrate_add_model_endpoint_refresh_columns()
     _migrate_add_model_endpoint_owner_column()
     _migrate_add_provider_auth_id_column()
+    _migrate_add_provider_auth_session_account_id_column()
     _migrate_add_supports_tools_column()
     _migrate_add_task_run_model_column()
     _migrate_add_owner_column()

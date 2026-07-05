@@ -2053,6 +2053,235 @@ export function displayMetrics(messageElement, metrics) {
   if (uiModule) uiModule.scrollHistory();
 }
 
+function _hasAgentProcess(metadata) {
+  return !!(
+    metadata &&
+    Array.isArray(metadata.tool_events) &&
+    metadata.tool_events.length > 0
+  );
+}
+
+export function getAgentFinalResponse(fallbackContent, metadata) {
+  const explicit = typeof metadata?.agent_final_response === 'string'
+    ? metadata.agent_final_response.trim()
+    : '';
+  if (explicit) return explicit;
+  if (metadata?.agent_stopped_before_final) return '';
+
+  const roundTexts = Array.isArray(metadata?.round_texts) ? metadata.round_texts : [];
+  for (let i = roundTexts.length - 1; i >= 0; i--) {
+    const txt = typeof roundTexts[i] === 'string' ? roundTexts[i].trim() : '';
+    if (txt) return txt;
+  }
+  return typeof fallbackContent === 'string' ? fallbackContent : '';
+}
+
+function _agentFinalRoundIndex(metadata) {
+  if (metadata?.agent_stopped_before_final && !metadata?.agent_final_response) return -1;
+  const roundTexts = Array.isArray(metadata?.round_texts) ? metadata.round_texts : [];
+  const finalText = getAgentFinalResponse('', metadata).trim();
+  for (let i = roundTexts.length - 1; i >= 0; i--) {
+    const txt = typeof roundTexts[i] === 'string' ? roundTexts[i].trim() : '';
+    if (txt && (!finalText || txt === finalText)) return i;
+  }
+  return -1;
+}
+
+function _buildAgentToolNode(ev) {
+  var esc = uiModule.esc;
+  const ok = (ev.exit_code === 0 || ev.exit_code == null);
+  let outHtml = '';
+  if (ev.output && ev.output.trim()) {
+    outHtml = `<details class="agent-tool-output"><summary>Output</summary><pre>${esc(ev.output)}</pre></details>`;
+  }
+  const screenshotSrc = safeToolScreenshotSrc(ev.screenshot);
+  if (screenshotSrc) {
+    outHtml += `<details class="agent-tool-output"><summary>Screenshot</summary><img src="${esc(screenshotSrc)}" style="max-width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--border)" /></details>`;
+  }
+
+  let evDiffHtml = '';
+  if (ev.diff && ev.diff.text) {
+    const d = ev.diff;
+    const stat = [
+      d.new_file ? '<span class="diff-stat-new">new</span>' : '',
+      d.added ? `<span class="diff-stat-add">+${d.added}</span>` : '',
+      d.removed ? `<span class="diff-stat-del">\u2212${d.removed}</span>` : '',
+    ].filter(Boolean).join(' ');
+    const rows = d.text.split('\n').map(line => {
+      let cls = 'diff-ctx', text = line;
+      if (line.startsWith('+++') || line.startsWith('---')) cls = 'diff-meta';
+      else if (line.startsWith('@@')) cls = 'diff-hunk';
+      else if (line.startsWith('+')) { cls = 'diff-add'; text = line.slice(1); }
+      else if (line.startsWith('-')) { cls = 'diff-del'; text = line.slice(1); }
+      else if (line.startsWith(' ')) { text = line.slice(1); }
+      return `<span class="${cls}">${esc(text) || '&nbsp;'}</span>`;
+    }).join('');
+    evDiffHtml = `<details class="agent-tool-output agent-tool-diff"><summary><span class="diff-file">${esc(d.file || 'diff')}</span> <span class="diff-summary-stats">${stat}</span></summary><pre class="diff-pre">${rows}</pre></details>`;
+  }
+
+  const node = document.createElement('div');
+  node.className = 'agent-thread-node' + (ok ? '' : ' error');
+  const evCmdHtml = (ev.command && !(ev.diff && ev.diff.text)) ? `<pre class="agent-thread-cmd">${esc(ev.command)}</pre>` : '';
+  node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(ev.tool)}</span><span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content">${evCmdHtml}${outHtml}${evDiffHtml}</div>`;
+  return node;
+}
+
+export function buildAgentProcessPanel(metadata, modelName, options = {}) {
+  if (!_hasAgentProcess(metadata)) return null;
+
+  const roundTexts = Array.isArray(metadata.round_texts) ? metadata.round_texts : [];
+  const toolEvents = Array.isArray(metadata.tool_events) ? metadata.tool_events : [];
+  const toolsByRound = {};
+  for (const ev of toolEvents) {
+    const r = ev.round || 1;
+    if (!toolsByRound[r]) toolsByRound[r] = [];
+    toolsByRound[r].push(ev);
+  }
+
+  const maxToolRound = Object.keys(toolsByRound).reduce((max, r) => Math.max(max, Number(r) || 0), 0);
+  const maxRound = Math.max(maxToolRound, roundTexts.length);
+  const finalRoundIndex = _agentFinalRoundIndex(metadata);
+
+  const details = document.createElement('details');
+  details.className = 'agent-process';
+  const summary = document.createElement('summary');
+  summary.className = 'agent-process-summary';
+  const actionCount = toolEvents.length;
+  summary.innerHTML = `
+    <span class="agent-process-summary-left">
+      <span class="agent-process-title">
+        <span class="agent-process-title-view">View agent process</span>
+        <span class="agent-process-title-hide">Hide agent process</span>
+      </span>
+    </span>
+    <span class="agent-process-summary-right">
+      <span class="agent-process-count">${actionCount} action${actionCount === 1 ? '' : 's'}</span>
+      <span class="agent-process-toggle" aria-hidden="true"></span>
+    </span>`;
+  details.appendChild(summary);
+
+  const body = document.createElement('div');
+  body.className = 'agent-process-body';
+  details.appendChild(body);
+
+  const limits = metadata.agent_limits || null;
+  if (limits && typeof limits === 'object') {
+    const usedRounds = Number.isFinite(Number(limits.rounds_used)) ? Number(limits.rounds_used) : roundTexts.length;
+    const maxRounds = Number.isFinite(Number(limits.max_rounds)) ? Number(limits.max_rounds) : null;
+    const usedTools = Number.isFinite(Number(limits.tool_calls_used)) ? Number(limits.tool_calls_used) : toolEvents.length;
+    const maxTools = Number.isFinite(Number(limits.max_tool_calls)) ? Number(limits.max_tool_calls) : null;
+    const toolLimit = maxTools && maxTools > 0 ? maxTools : 'unlimited';
+    const bits = [];
+    if (maxRounds) bits.push(`${usedRounds}/${maxRounds} rounds`);
+    bits.push(`${usedTools}/${toolLimit} tools`);
+    bits.push(`verifier ${limits.verifier_enabled ? 'on' : 'off'}`);
+    if (limits.workspace_bound) {
+      const workspaceLabel = String(limits.workspace_label || limits.workspace_path || '').trim();
+      bits.push(workspaceLabel ? `workspace ${workspaceLabel}` : 'workspace active');
+      bits.push(`workspace policy ${limits.workspace_shell_writes_blocked ? 'on' : 'active'}`);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'agent-process-meta';
+    meta.textContent = `Limits: ${bits.join(' | ')}`;
+    body.appendChild(meta);
+  }
+
+  let renderedAny = false;
+  for (let r = 0; r < maxRound; r++) {
+    const roundNum = r + 1;
+    const txt = (roundTexts[r] || '').trim();
+    const roundTools = toolsByRound[roundNum] || [];
+    const showText = txt && !(r === finalRoundIndex && !options.includeFinalRoundText);
+
+    if (showText) {
+      const step = document.createElement('div');
+      step.className = 'agent-process-round';
+      const label = document.createElement('div');
+      label.className = 'agent-process-round-label';
+      const pair = replyModelPair(modelName, metadata);
+      label.textContent = pair.actualModel || pair.requestedModel
+        ? `${modelRouteLabel(pair.requestedModel, pair.actualModel || pair.requestedModel)} / round ${roundNum}`
+        : `round ${roundNum}`;
+      step.appendChild(label);
+      const textBody = document.createElement('div');
+      textBody.className = 'agent-process-round-text';
+      textBody.innerHTML = markdownModule.processWithThinking(markdownModule.squashOutsideCode(txt));
+      step.appendChild(textBody);
+      body.appendChild(step);
+      renderedAny = true;
+    }
+
+    if (roundTools.length > 0) {
+      const threadWrap = document.createElement('div');
+      threadWrap.className = 'agent-thread agent-process-thread';
+      for (const ev of roundTools) threadWrap.appendChild(_buildAgentToolNode(ev));
+      body.appendChild(threadWrap);
+      renderedAny = true;
+    }
+
+    for (const ev of roundTools) {
+      if (ev.image_url) {
+        body.appendChild(buildImageBubble(ev.image_url, ev.image_prompt, ev.image_model, ev.image_size, ev.image_quality, ev.image_id));
+        renderedAny = true;
+      }
+    }
+  }
+
+  return renderedAny ? details : null;
+}
+
+export function collapseAgentProcessAfterStream(firstWrap, finalWrap, metadata, modelName) {
+  const panel = buildAgentProcessPanel(metadata, modelName);
+  if (!panel || !firstWrap || !finalWrap) return finalWrap || firstWrap || null;
+
+  const target = finalWrap.classList?.contains('msg-ai') ? finalWrap : firstWrap;
+  const finalText = getAgentFinalResponse(target.dataset?.raw || '', metadata).trim();
+  if (finalText) target.dataset.raw = finalText;
+
+  const body = target.querySelector('.body');
+  if (body && finalText) {
+    let sourcesPrefix = '';
+    let findingsSuffix = '';
+    if (metadata?.research_sources?.length) {
+      sourcesPrefix = buildSourcesBox(metadata.research_sources, 'research');
+    } else if (metadata?.web_sources?.length) {
+      sourcesPrefix = buildSourcesBox(metadata.web_sources, 'web');
+    }
+    if (metadata?.research_findings?.length) {
+      findingsSuffix = buildFindingsBox(metadata.research_findings);
+    }
+    if (metadata?.rag_sources?.length) {
+      findingsSuffix += buildRagSourcesBox(metadata.rag_sources);
+    }
+    body.innerHTML = sourcesPrefix
+      + markdownModule.processWithThinking(markdownModule.squashOutsideCode(finalText))
+      + findingsSuffix;
+  }
+  if (body && !body.querySelector(':scope > .agent-process')) {
+    body.insertBefore(panel, body.firstChild);
+  }
+
+  let node = firstWrap;
+  let passedTarget = false;
+  while (node) {
+    const next = node.nextElementSibling;
+    if (node === target) {
+      passedTarget = true;
+    } else if (
+      node.classList?.contains('agent-thread') ||
+      (!passedTarget && node.classList?.contains('msg-ai')) ||
+      (passedTarget && node.classList?.contains('msg-continuation'))
+    ) {
+      node.remove();
+    }
+    if (passedTarget && next && !next.classList?.contains('agent-thread') && !next.classList?.contains('msg-continuation')) break;
+    node = next;
+  }
+  target.classList.remove('msg-continuation');
+  target.style.display = '';
+  return target;
+}
+
 /** Remove any unanswered multiple-choice cards currently in the chat. */
 export function removeAskUserCards(root) {
   const scope = root || document.getElementById('chat-history') || document;
@@ -2204,10 +2433,16 @@ export function addMessage(role, content, modelName, metadata) {
     if (role === 'user') removeAskUserCards(box);
 
     var esc = uiModule.esc;
-    const textRaw = Array.isArray(content) ? markdownModule.renderContent(content) : content;
+    let textRaw = Array.isArray(content) ? markdownModule.renderContent(content) : content;
+    const agentProcessPanel = _hasAgentProcess(metadata)
+      ? buildAgentProcessPanel(metadata, modelName)
+      : null;
+    if (agentProcessPanel) {
+      textRaw = getAgentFinalResponse(textRaw, metadata);
+    }
 
     // --- Agent multi-bubble reconstruction from saved metadata ---
-    if (role === 'assistant' && metadata && metadata.tool_events && metadata.tool_events.length > 0) {
+    if (!agentProcessPanel && role === 'assistant' && metadata && metadata.tool_events && metadata.tool_events.length > 0) {
       const roundTexts = metadata.round_texts || [];
       const toolEvents = metadata.tool_events;
       let pendingAskUser = null;
@@ -2515,15 +2750,43 @@ export function addMessage(role, content, modelName, metadata) {
       const stoppedIndicator = document.createElement('div');
       stoppedIndicator.className = 'stopped-indicator';
       const stoppedLabel = document.createElement('span');
+      const timedOut = metadata.timed_out ||
+        metadata.stop_reason === 'idle_timeout' ||
+        metadata.stop_reason === 'wall_clock_timeout';
+      const lostAfterRestart = metadata.run_status === 'lost_after_restart' ||
+        metadata.stop_reason === 'server_restart';
+      const runFailed = metadata.run_status === 'error' ||
+        metadata.stop_reason === 'error';
+      const stoppedBeforeFinal = !!metadata.agent_stopped_before_final;
+      const hasCapturedAgentProcess = (
+        Array.isArray(metadata.tool_events) && metadata.tool_events.length > 0
+      ) || (
+        Array.isArray(metadata.round_texts) &&
+        metadata.round_texts.some(txt => typeof txt === 'string' && txt.trim())
+      );
       // Differentiate between "stopped mid-stream" (had content, can continue)
       // and "cancelled before any content" — the latter has no Continue affordance.
-      stoppedLabel.textContent = metadata.cancelled
+      stoppedLabel.textContent = timedOut
+        ? '[Agent stopped after timeout]'
+        : lostAfterRestart
+        ? '[Agent stopped after server restart]'
+        : runFailed
+        ? '[Agent run failed]'
+        : stoppedBeforeFinal
+        ? '[Agent stopped before final answer]'
+        : metadata.cancelled
         ? '[Cancelled by user]'
         : '[Message interrupted]';
       stoppedIndicator.appendChild(stoppedLabel);
+      if (stoppedBeforeFinal && !hasCapturedAgentProcess) {
+        const stoppedDetail = document.createElement('span');
+        stoppedDetail.className = 'stopped-detail';
+        stoppedDetail.textContent = 'No tool actions were captured before the stop.';
+        stoppedIndicator.appendChild(stoppedDetail);
+      }
       // Continue button only makes sense when there's partial content to
-      // resume from \u2014 skip it for fully-cancelled (empty) turns.
-      if (!metadata.cancelled) {
+      // resume from - skip it for fully-cancelled/timeout/lost/failed turns.
+      if (!metadata.cancelled && !timedOut && !lostAfterRestart && !runFailed) {
         const continueBtn = document.createElement('button');
         continueBtn.className = 'continue-btn';
         continueBtn.title = 'Continue';
@@ -2537,7 +2800,9 @@ export function addMessage(role, content, modelName, metadata) {
             const cutoff = rawText;
             const msgInput = document.getElementById('message');
             if (msgInput) {
-              msgInput.value = 'Your previous response was interrupted. It ended with:\n\n' + cutoff.slice(-500) + '\n\nDo NOT repeat what you already said. Continue exactly from where you were cut off.';
+              msgInput.value = stoppedBeforeFinal
+                ? 'Continue the interrupted agent task from the existing process state. Do not repeat completed tool work; finish the task and provide the final answer.'
+                : 'Your previous response was interrupted. It ended with:\n\n' + cutoff.slice(-500) + '\n\nDo NOT repeat what you already said. Continue exactly from where you were cut off.';
               const sb = document.querySelector('.send-btn');
               if (sb) sb.click();
             }
@@ -2645,6 +2910,10 @@ export function addMessage(role, content, modelName, metadata) {
       r.appendChild(nav);
     }
 
+    if (role === 'assistant' && agentProcessPanel && !b.querySelector(':scope > .agent-process')) {
+      b.insertBefore(agentProcessPanel, b.firstChild);
+    }
+
     if (role === 'assistant') {
       // The "N pinned" / "N recalled" pill in the footer reads from
       // wrap._memoriesUsed — propagate it from saved metadata so the pill
@@ -2689,6 +2958,9 @@ const chatRenderer = {
   updateSessionCostUI,
   roleTimestamp,
   stripToolBlocks,
+  getAgentFinalResponse,
+  buildAgentProcessPanel,
+  collapseAgentProcessAfterStream,
   copyMessageText,
   safeToolScreenshotSrc,
   safeDisplayImageSrc,

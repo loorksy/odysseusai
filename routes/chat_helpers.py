@@ -991,6 +991,346 @@ def clean_thinking_for_save(content: str, metadata: dict | None = None) -> tuple
     return content, md
 
 
+def prepare_agent_response_for_save(
+    full_response: str,
+    last_metrics: dict | None,
+    user_message: str | None = None,
+) -> tuple[str, dict | None]:
+    """Return final display content plus metrics for a completed agent turn.
+
+    Agent mode streams model text from every tool round into ``full_response``.
+    When the loop reports persisted tool metadata, prefer the last non-empty
+    cleaned round as the saved answer and keep the process in metadata for UI
+    reconstruction/expansion.
+    """
+    if not isinstance(last_metrics, dict) or not last_metrics.get("tool_events"):
+        return _guard_unverified_agent_file_success(
+            user_message,
+            full_response,
+            last_metrics,
+        )
+
+    round_texts = last_metrics.get("round_texts")
+    if not isinstance(round_texts, list):
+        return _guard_unverified_agent_file_success(
+            user_message,
+            full_response,
+            last_metrics,
+        )
+
+    final_response = ""
+    for text in reversed(round_texts):
+        if isinstance(text, str) and text.strip():
+            final_response = text.strip()
+            break
+
+    if not final_response:
+        return _guard_unverified_agent_file_success(
+            user_message,
+            full_response,
+            last_metrics,
+        )
+
+    metadata = dict(last_metrics)
+    metadata["agent_final_response"] = final_response
+    if final_response.strip() != (full_response or "").strip():
+        metadata["agent_saved_final_only"] = True
+        metadata["agent_accumulated_response_chars"] = len(full_response or "")
+    return _guard_unverified_agent_file_success(
+        user_message,
+        final_response,
+        metadata,
+    )
+
+
+def prepare_stopped_agent_response_for_save(
+    full_response: str,
+    last_metrics: dict | None = None,
+    *,
+    observed_round_texts: list | None = None,
+    observed_tool_events: list | None = None,
+    final_response: str = "",
+    stop_reason: str = "",
+    model: str = "",
+    requested_model: str = "",
+) -> tuple[str, dict]:
+    """Return display content + metadata for an interrupted agent turn.
+
+    Agent partial text is often process chatter rather than an answer. When an
+    agent is stopped before an `agent_final` event, save an empty visible
+    placeholder and preserve process details in metadata for the collapsed
+    Process panel instead of promoting the partial process text to the reply.
+    """
+    metadata = dict(last_metrics) if isinstance(last_metrics, dict) else {}
+
+    if observed_round_texts and not isinstance(metadata.get("round_texts"), list):
+        metadata["round_texts"] = [
+            text for text in observed_round_texts
+            if isinstance(text, str)
+        ]
+    if observed_tool_events and not isinstance(metadata.get("tool_events"), list):
+        metadata["tool_events"] = [
+            dict(event) for event in observed_tool_events
+            if isinstance(event, dict)
+        ]
+
+    metadata["stopped"] = True
+    reason = str(stop_reason or "").strip()
+    if reason:
+        metadata["stop_reason"] = reason
+        if reason in {"idle_timeout", "wall_clock_timeout"}:
+            metadata["timed_out"] = True
+        if reason == "user_stop":
+            metadata["cancelled"] = True
+    if model and not metadata.get("model"):
+        metadata["model"] = model
+    if requested_model and not metadata.get("requested_model"):
+        metadata["requested_model"] = requested_model
+
+    visible_final = str(final_response or "").strip()
+    if visible_final:
+        metadata["agent_final_response"] = visible_final
+        return visible_final, metadata
+
+    raw_partial = str(full_response or "")
+    metadata["agent_stopped_before_final"] = True
+    if raw_partial.strip():
+        metadata["agent_partial_response_hidden"] = True
+        metadata["agent_accumulated_response_chars"] = len(raw_partial)
+    return "", metadata
+
+
+_FILE_MUTATION_REQUEST_RE = re.compile(
+    r"\b(copy|create|write|append|edit|modify|replace|rename|move|save|"
+    r"update|change|delete)\b",
+    re.IGNORECASE,
+)
+_FILE_TARGET_RE = re.compile(
+    r"(/workspace\b|\\|/|\bfile\b|\bfolder\b|\bworkspace\b|\bproject\b|"
+    r"\brepo\b|\breadme\b|\.[A-Za-z0-9]{1,12}\b)",
+    re.IGNORECASE,
+)
+_SUCCESS_CLAIM_RE = re.compile(
+    r"\b(done|created|copied|wrote|written|appended|edited|updated|"
+    r"saved|completed|success(?:ful|fully)?|verified)\b",
+    re.IGNORECASE,
+)
+_BLOCKED_OR_FAILURE_RE = re.compile(
+    r"\b(not completed|not created|not copied|not written|not saved|"
+    r"couldn['’]?t|cannot|can['’]?t|failed|blocked|unable|permission denied)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_file_mutation_request(user_message: str | None) -> bool:
+    text = (user_message or "").strip()
+    if not text:
+        return False
+    return bool(_FILE_MUTATION_REQUEST_RE.search(text) and _FILE_TARGET_RE.search(text))
+
+
+def _looks_like_success_claim(final_response: str | None) -> bool:
+    text = (final_response or "").strip()
+    if not text:
+        return False
+    if _BLOCKED_OR_FAILURE_RE.search(text):
+        return False
+    return bool(_SUCCESS_CLAIM_RE.search(text))
+
+
+_PATHISH_RE = re.compile(
+    r"(?<![\w.-])(?:"
+    r"(?:[A-Za-z]:[\\/][^\s`'\"<>]+)|"
+    r"(?:/[^\s`'\"<>]+)|"
+    r"(?:(?:[\w.-]+[\\/])+[\w.-]+\.[A-Za-z0-9]{1,12})|"
+    r"(?:[\w.-]+\.[A-Za-z0-9]{1,12})"
+    r")"
+)
+_DOUBLE_QUOTED_RE = re.compile(r'"([^"\r\n]{2,500})"')
+
+
+def _clean_pathish_token(value: str) -> str:
+    return (value or "").strip().strip("`'\"()[]{}<>.,;:")
+
+
+def _normalize_pathish(value: str) -> str:
+    token = _clean_pathish_token(value).replace("\\", "/")
+    while token.startswith("./"):
+        token = token[2:]
+    token = token.rstrip("/")
+    lowered = token.lower()
+    if lowered.startswith("/workspace/"):
+        lowered = lowered[len("/workspace/"):]
+    return lowered
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        cleaned = _clean_pathish_token(value)
+        key = _normalize_pathish(cleaned)
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out
+
+
+def _extract_path_mentions(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return _dedupe_preserve_order([m.group(0) for m in _PATHISH_RE.finditer(text)])
+
+
+def _extract_explicit_destination_paths(user_message: str | None) -> list[str]:
+    text = user_message or ""
+    candidates: list[str] = []
+    patterns = [
+        r"\b(?:copy|move|rename)\b[\s\S]{0,180}?\b(?:to|into|as)\s+([^,\r\n.;]+)",
+        r"\b(?:append|add|write|save|insert)\b[\s\S]{0,160}?\b(?:to|into|in)\s+([^,\r\n.;]+)",
+        r"\b(?:create|write|save)\b[\s\S]{0,100}?\b(?:file|copy)\s+(?:named|called|as)\s+([^,\r\n.;]+)",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            candidates.extend(_extract_path_mentions(match.group(1)))
+    return _dedupe_preserve_order(candidates)
+
+
+def _extract_expected_content_snippets(user_message: str | None) -> list[str]:
+    text = user_message or ""
+    snippets: list[str] = []
+    for match in _DOUBLE_QUOTED_RE.finditer(text):
+        snippet = match.group(1).strip()
+        if not snippet:
+            continue
+        # Quoted file names usually also appear as paths. They are useful for
+        # path checks but too noisy as content expectations.
+        if _PATHISH_RE.fullmatch(snippet):
+            continue
+        snippets.append(snippet)
+    return _dedupe_preserve_order(snippets)
+
+
+def _event_text_for_verification(ev: dict) -> str:
+    parts: list[str] = []
+    for key in ("command", "output"):
+        value = ev.get(key)
+        if value not in (None, ""):
+            parts.append(str(value))
+    diff = ev.get("diff")
+    if isinstance(diff, dict):
+        for key in ("file", "text"):
+            value = diff.get(key)
+            if value not in (None, ""):
+                parts.append(str(value))
+    return "\n".join(parts)
+
+
+def _successful_file_mutation_events(tool_events: list) -> list[dict]:
+    events: list[dict] = []
+    for ev in tool_events or []:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("exit_code") not in (None, 0):
+            continue
+        tool = str(ev.get("tool") or "").lower()
+        output = str(ev.get("output") or "")
+        if tool in {"write_file", "edit_file"}:
+            events.append(ev)
+            continue
+        if output.startswith("Written:"):
+            events.append(ev)
+    return events
+
+
+def _evidence_paths_for_events(events: list[dict]) -> list[str]:
+    paths: list[str] = []
+    for ev in events:
+        paths.extend(_extract_path_mentions(_event_text_for_verification(ev)))
+    return _dedupe_preserve_order(paths)
+
+
+def _paths_overlap(expected_paths: list[str], evidence_paths: list[str]) -> bool:
+    expected = [_normalize_pathish(path) for path in expected_paths if path]
+    evidence = [_normalize_pathish(path) for path in evidence_paths if path]
+    for exp in expected:
+        for got in evidence:
+            if got == exp or got.endswith("/" + exp) or exp.endswith("/" + got):
+                return True
+    return False
+
+
+def _has_expected_content_evidence(expected_snippets: list[str], events: list[dict]) -> bool:
+    if not expected_snippets:
+        return True
+    evidence_text = "\n".join(_event_text_for_verification(ev) for ev in events).lower()
+    return all(snippet.lower() in evidence_text for snippet in expected_snippets)
+
+
+def _verify_file_mutation_evidence(
+    tool_events: list,
+    *,
+    user_message: str | None,
+    final_response: str | None,
+) -> tuple[bool, str]:
+    mutation_events = _successful_file_mutation_events(tool_events)
+    if not mutation_events:
+        return False, "no successful write_file/edit_file event"
+
+    explicit_targets = _extract_explicit_destination_paths(user_message)
+    claimed_targets = _extract_path_mentions(final_response)
+    expected_targets = explicit_targets or claimed_targets
+    evidence_paths = _evidence_paths_for_events(mutation_events)
+    if expected_targets and not _paths_overlap(expected_targets, evidence_paths):
+        return False, "successful file tool did not target the requested or claimed path"
+
+    expected_snippets = _extract_expected_content_snippets(user_message)
+    if not _has_expected_content_evidence(expected_snippets, mutation_events):
+        return False, "successful file tool evidence did not include the requested content"
+
+    return True, "matched successful file-tool evidence"
+
+
+def _guard_unverified_agent_file_success(
+    user_message: str | None,
+    final_response: str,
+    last_metrics: dict | None,
+) -> tuple[str, dict | None]:
+    if not (
+        _looks_like_file_mutation_request(user_message)
+        and _looks_like_success_claim(final_response)
+    ):
+        return final_response, last_metrics
+
+    tool_events = []
+    if isinstance(last_metrics, dict) and isinstance(last_metrics.get("tool_events"), list):
+        tool_events = last_metrics["tool_events"]
+
+    metadata = dict(last_metrics or {})
+    verified, reason = _verify_file_mutation_evidence(
+        tool_events,
+        user_message=user_message,
+        final_response=final_response,
+    )
+    metadata["agent_file_mutation_verification_reason"] = reason
+    if verified:
+        metadata["agent_file_mutation_verified"] = True
+        return final_response, metadata
+
+    metadata["agent_file_mutation_verification_failed"] = True
+    metadata["agent_unverified_final_response"] = final_response
+    guarded = (
+        "I couldn't verify that the requested workspace file change completed, "
+        "so I won't claim it did. Expand Process to inspect the tool results, "
+        "or ask me to retry using the file tools."
+    )
+    metadata["agent_final_response"] = guarded
+    if final_response.strip() != guarded:
+        metadata["agent_saved_final_only"] = True
+    return guarded, metadata
+
+
 def save_assistant_response(
     sess,
     session_manager,

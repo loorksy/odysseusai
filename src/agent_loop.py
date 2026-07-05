@@ -9,6 +9,7 @@ The LLM decides when to use tools by writing fenced code blocks.
 import asyncio
 import collections
 import json
+import os
 import re
 import time
 import logging
@@ -664,6 +665,18 @@ _ADMIN_SCHEMA_NAMES = frozenset([
 _TOOL_SELECTION_TIMEOUT_SECONDS = 1.5
 
 
+def _workspace_display_label(workspace: Optional[str]) -> str:
+    """Return a user-facing label for a bound workspace, if configured."""
+    ws = str(workspace or "").strip()
+    if not ws:
+        return ""
+    label = os.environ.get("ODYSSEUS_WORKSPACE_LABEL", "").strip()
+    alias_path = os.environ.get("ODYSSEUS_DEFAULT_WORKSPACE", "/workspace").strip()
+    if label and alias_path and os.path.normpath(ws) == os.path.normpath(alias_path):
+        return f"{label} (mounted as {ws})"
+    return ws
+
+
 def _is_ollama_openai_compat_url(endpoint_url: str) -> bool:
     """Return True for local Ollama's OpenAI-compatible /v1 surface.
 
@@ -836,6 +849,18 @@ def _strip_think_blocks(text: str) -> str:
 
 
 _LOW_SIGNAL_RE = re.compile(r"^[\W_]*$", re.UNICODE)
+_FILE_MUTATION_VERB_RE = re.compile(
+    r"\b(copy|append|write|create|make|add|insert|edit|modify|update|replace|rename|delete|remove|move|save)\b",
+    re.IGNORECASE,
+)
+_FILE_TARGET_HINT_RE = re.compile(
+    r"("
+    r"\b(files?|folders?|director(?:y|ies)|repos?|repositories|workspace|project|readme|changelog|license|dockerfile|makefile)\b"
+    r"|(?:^|[\s'\"`])(?:\.{1,2}[\\/]|[A-Za-z]:[\\/]|~[\\/]|/[\w.-]|[\w.-]+[\\/])"
+    r"|\b[\w.-]+\.(?:txt|md|markdown|py|js|jsx|ts|tsx|json|toml|ya?ml|ini|cfg|conf|env|html|css|scss|rs|go|java|kt|cs|cpp|c|h|hpp|sh|ps1|bat|cmd|sql|xml|csv|log|lock)\b"
+    r")",
+    re.IGNORECASE,
+)
 _CASUAL_OPENING_RE = re.compile(
     r"^\s*(?:h+i+|hey+|hello+|yo+|sup+|what'?s up|wass?up|hiya|howdy|"
     r"lol|lmao|haha+|hehe+|thanks?|thank you|ty|idk|dunno|meh|bruh|bro)\b(?P<tail>.*)$",
@@ -877,6 +902,12 @@ _COOKBOOK_CONTEXT_RE = re.compile(
 def _is_explicit_continuation(text: str) -> bool:
     """Only these terse replies may inherit older user turns for tool retrieval."""
     return bool(_EXPLICIT_CONTINUATION_RE.match(str(text or "").strip()))
+
+
+def _looks_like_file_mutation(text: str) -> bool:
+    """True for write/edit/copy requests aimed at files or a workspace path."""
+    q = str(text or "")
+    return bool(_FILE_MUTATION_VERB_RE.search(q) and _FILE_TARGET_HINT_RE.search(q))
 
 
 def _is_casual_low_signal(text: str) -> bool:
@@ -961,10 +992,12 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
             "low_signal": True,
             "continuation": False,
             "domains": set(),
+            "file_mutation": False,
             "retrieval_query": text,
         }
 
     domains: Set[str] = set()
+    file_mutation = _looks_like_file_mutation(q)
 
     def has(*patterns: str) -> bool:
         return any(re.search(p, q) for p in patterns)
@@ -984,9 +1017,9 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         r"ruby|php|swift|kotlin|bash|shell|html|css|sql)\b",
         r"\b(?:code|script|program|game|function|class|module|app)\b",
     )
-    if has(r"\b(documents?|docs?|draft|compose|poem|story|essay|outline|letter|edit|rewrite|proofread|suggest|feedback|review this|make a file)\b"):
+    if not file_mutation and not _code_write_intent and has(r"\b(documents?|docs?|draft|compose|poem|story|essay|outline|letter|edit|rewrite|proofread|suggest|feedback|review this|make a file)\b"):
         domains.add("documents")
-    if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
+    if "notes_calendar_tasks" not in domains and not file_mutation and not _code_write_intent and has(r"\bwrite\b"):
         domains.add("documents")
     if has(r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b"):
         domains.add("web")
@@ -1004,7 +1037,7 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("sessions")
     if has(r"\b(file|folder|directory|repo|git|grep|find in files|read file|edit file|shell|terminal|bash)\b"):
         domains.add("files")
-    if has(
+    if file_mutation or has(
         r"\b(run|execute|test|debug|fix|save|create|edit|read|open)\b.{0,40}\b("
         r"python|javascript|typescript|java|c\+\+|cpp|c#|csharp|rust|go|golang|"
         r"ruby|php|swift|kotlin|bash|shell|html|css|sql|code|script|program|game"
@@ -1040,6 +1073,7 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         "low_signal": low_signal,
         "continuation": continuation,
         "domains": domains,
+        "file_mutation": file_mutation,
         "retrieval_query": retrieval_query,
     }
 
@@ -1303,6 +1337,7 @@ def _build_system_prompt(
     compact: bool = False,
     owner: Optional[str] = None,
     suppress_local_context: bool = False,
+    workspace: Optional[str] = None,
     suppress_skills: bool = False,
     active_email: Optional[Dict[str, str]] = None,
 ) -> List[Dict]:
@@ -1374,6 +1409,46 @@ def _build_system_prompt(
         _datetime_message = current_datetime_context_message()
     except Exception as e:
         logger.warning("Failed to build datetime context message", exc_info=e)
+
+    _workspace_message = None
+    if workspace and not suppress_local_context:
+        _ws = str(workspace).strip()
+        if _ws:
+            _ws_prompt = _ws.replace("`", "\\`")
+            _ws_label = _workspace_display_label(_ws)
+            _ws_label_prompt = _ws_label.replace("`", "\\`")
+            _alias_line = ""
+            if _ws_label and _ws_label != _ws:
+                _alias_line = (
+                    f"- User-facing workspace label: `{_ws_label_prompt}`. "
+                    f"Treat references to `{_ws_prompt}` and this label as the same workspace; use `{_ws_prompt}` or relative paths in file tools.\n"
+                )
+            _workspace_message = {
+                "role": "system",
+                "_protected": True,
+                "content": (
+                    "## ACTIVE WORKSPACE CONTRACT\n"
+                    f"An approved workspace is active for this turn: `{_ws_prompt}`.\n"
+                    f"{_alias_line}"
+                    "- The user may refer to this as the workspace, project, repo, folder, or local files.\n"
+                    "- File tools (`get_workspace`, `ls`, `glob`, `grep`, `read_file`, `write_file`, `edit_file`) are allowed inside this workspace and may use paths relative to it.\n"
+                    "- For file reads/searches/edits, prefer those file tools over shell commands.\n"
+                    "- Do not say you lack permission to read or write the workspace unless a tool result explicitly says the action was blocked or failed.\n"
+                    "- For file create/copy/write/edit requests, verify the artifact with a file tool before claiming success."
+                ),
+            }
+
+    _final_answer_message = {
+        "role": "system",
+        "_protected": True,
+        "content": (
+            "## FINAL ANSWER CONTRACT\n"
+            "After tool work is complete and no more tools are needed, write only the final answer for the user.\n"
+            "- Keep the final answer concise by default, even if the solving phase used high reasoning or verbosity.\n"
+            "- Do not replay tool commands, raw logs, or earlier failed attempts unless the user explicitly asks for process details.\n"
+            "- Prefer 1-4 sentences or a short bullet list. If blocked, state the exact blocker and the next useful action."
+        ),
+    }
 
     # Document context is kept as a SEPARATE message (not merged into the tool
     # prompt) so the context trimmer doesn't destroy it when truncating the
@@ -1813,6 +1888,12 @@ def _build_system_prompt(
         if merged[i].get("role") == "user":
             last_user_idx = i
             break
+    if _workspace_message:
+        merged.insert(last_user_idx, _workspace_message)
+        last_user_idx += 1
+    if _final_answer_message:
+        merged.insert(last_user_idx, _final_answer_message)
+        last_user_idx += 1
     if _doc_message:
         merged.insert(last_user_idx, _doc_message)
         last_user_idx += 1  # the document message is now at last_user_idx
@@ -2148,7 +2229,7 @@ def _compute_final_metrics(
 # read-only / Q&A turns are not.
 _VERIFIER_EFFECTFUL_TOOLS = {
     "create_document", "update_document", "edit_document",
-    "bash", "python", "write_file",
+    "bash", "python", "write_file", "edit_file",
 }
 _VERIFIER_MAX_ROUNDS = 2  # cap re-verify cycles per turn — never loop forever
 
@@ -2304,6 +2385,282 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+_WORKSPACE_FILE_TOOL_RECOVERY_TOOLS = {
+    "get_workspace", "ls", "glob", "grep", "read_file", "write_file", "edit_file",
+}
+_MAX_WORKSPACE_SHELL_WRITE_RECOVERY_NUDGES = 2
+_MAX_INCOMPLETE_FINAL_NUDGES = 2
+_MAX_EMPTY_RESPONSE_RETRIES = 2
+_MAX_WORKSPACE_CLARIFICATION_NUDGES = 1
+_MAX_WORKSPACE_TARGET_RECOVERY_NUDGES = 1
+
+_WORKSPACE_READ_TOOL_NAMES = {"get_workspace", "ls", "glob", "grep", "read_file"}
+_WORKSPACE_FILE_TOOL_NAMES = _WORKSPACE_READ_TOOL_NAMES | {"write_file", "edit_file"}
+_WORKSPACE_TARGET_RECOVERY_TOOLS = _WORKSPACE_READ_TOOL_NAMES
+
+_WORKSPACE_INSPECTION_REQUEST_RE = re.compile(
+    r"(?:"
+    r"\b(?:read|inspect|summari[sz]e|list|show|check|look\s+at|review|find|"
+    r"search|grep|open|describe|tell\s+me|what(?:'s|\s+is)|what\s+files?)\b"
+    r"[^.\n]{0,180}"
+    r"\b(?:workspace|project|repo|repository|folder|directory|files?|readme|"
+    r"codebase|local|here)\b"
+    r"|"
+    r"\b(?:workspace|project|repo|repository|folder|directory|files?|readme|"
+    r"codebase|local)\b"
+    r"[^.\n]{0,180}"
+    r"\b(?:read|inspect|summari[sz]e|list|show|check|review|find|search|grep|"
+    r"open|describe)\b"
+    r")",
+    re.IGNORECASE,
+)
+_WORKSPACE_CLARIFICATION_RE = re.compile(
+    r"(?:"
+    r"\b(?:which|what|where)\b[^?\n]{0,180}"
+    r"\b(?:file|folder|directory|path|workspace|project|repo|repository|readme)\b"
+    r"|"
+    r"\b(?:please|can\s+you|could\s+you|would\s+you)\b[^?\n]{0,180}"
+    r"\b(?:provide|specify|confirm|share|send|tell\s+me|give\s+me)\b[^?\n]{0,140}"
+    r"\b(?:file|folder|directory|path|workspace|project|repo|repository|readme)\b"
+    r"|"
+    r"\b(?:i\s+need|i'?ll\s+need|i\s+would\s+need|need)\b[^.\n]{0,180}"
+    r"\b(?:file|folder|directory|path|workspace|project|repo|repository|readme|"
+    r"more\s+details|clarification)\b"
+    r"|"
+    r"\b(?:i\s+can't|i\s+cannot|i\s+couldn'?t|i\s+do\s+not|i\s+don't)\b[^.\n]{0,180}"
+    r"\b(?:see|access|know|find|determine)\b[^.\n]{0,140}"
+    r"\b(?:workspace|project|files?|folder|directory|path|readme)\b"
+    r")",
+    re.IGNORECASE,
+)
+_WORKSPACE_TARGET_FAILURE_RE = re.compile(
+    r"(?:"
+    r"\b(?:unable|not\s+able|can't|cannot|couldn'?t|blocked|failed)\b"
+    r"[^.\n]{0,180}\b(?:read|inspect|access|find|open|summari[sz]e)\b"
+    r"[^.\n]{0,160}\b(?:workspace|readme|files?|folder|directory|path)\b"
+    r"|"
+    r"\b(?:workspace|readme|files?|folder|directory|path)\b"
+    r"[^.\n]{0,180}\b(?:returning\s+no\s+content|not\s+found|no\s+content|"
+    r"not\s+accessible|isn'?t\s+accessible)\b"
+    r"|"
+    r"\bplease\s+(?:paste|upload|provide|send)\b[^.\n]{0,140}"
+    r"\b(?:readme|file|contents?|text)\b"
+    r"|"
+    r"\b(?:allow\s+me|confirm\s+whether)\b[^.\n]{0,180}"
+    r"\b(?:try|use)\b[^.\n]{0,120}\b(?:bash|filename|file|readme|guess)"
+    r")",
+    re.IGNORECASE,
+)
+_WORKSPACE_TARGET_NOT_FOUND_RE = re.compile(
+    r"\b(?:not\s+found|no\s+such\s+file|does\s+not\s+exist|couldn'?t\s+find|"
+    r"can't\s+find|cannot\s+find)\b",
+    re.IGNORECASE,
+)
+_GENERIC_README_REQUEST_RE = re.compile(r"\breadme\b", re.IGNORECASE)
+_EXPLICIT_README_PATH_RE = re.compile(r"\breadme\.[A-Za-z0-9]{1,12}\b", re.IGNORECASE)
+
+_INCOMPLETE_FINAL_ACTION_RE = re.compile(
+    r"(?:^|[\n.!?]\s*)"
+    r"(?:(?:sure|okay|ok|yes|absolutely|of course|got it)[,!\s-]*)?"
+    r"(?:(?:first|next|now|then|after that|from here|to do this)[,:\s-]*)?"
+    r"(?:"
+    r"i\s*(?:'ll|will|am going to)|"
+    r"i'?m\s+going\s+to|"
+    r"let\s+me|"
+    r"we\s*(?:'ll|will|are going to)|"
+    r"we'?re\s+going\s+to|"
+    r"i\s+(?:need|should|must|can)\s+to|"
+    r"we\s+(?:need|should|must|can)\s+to|"
+    r"my\s+next\s+step\s+is\s+to|"
+    r"the\s+next\s+step\s+is\s+to|"
+    r"i\s+can\s+do\s+this\s+by"
+    r")"
+    r"\s+[^.\n]{0,180}\b"
+    r"(?:read|write|edit|create|copy|append|verify|check|inspect|run|search|"
+    r"list|open|modify|update|fix|test|build|commit|send|draft|delete|remove|"
+    r"rename|move|upload|download|fetch|look\s+up|find|diagnose|review|"
+    r"summari[sz]e|analy[sz]e|compare|install|start|stop|restart|call|use)"
+    r"\b",
+    re.IGNORECASE,
+)
+_INCOMPLETE_FINAL_BLOCKER_RE = re.compile(
+    r"\b(?:blocked|permission denied|not allowed|can't|cannot|couldn't|unable|"
+    r"failed|failure|error|need (?:you|the user) to|please (?:provide|choose|"
+    r"confirm))\b",
+    re.IGNORECASE,
+)
+
+
+def _tool_schema_name(schema: dict) -> str:
+    if not isinstance(schema, dict):
+        return ""
+    fn = schema.get("function")
+    if isinstance(fn, dict):
+        return str(fn.get("name") or "")
+    return str(schema.get("name") or "")
+
+
+def _find_incomplete_final_promise(text: str):
+    """Return the first unfinished promise/plan in a no-tool final answer."""
+    visible = strip_tool_blocks(text or "").strip()
+    visible = re.sub(r"<think>.*?</think>", "", visible, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not visible or "```" in visible or len(visible) > 2000:
+        return None
+    if _INCOMPLETE_FINAL_BLOCKER_RE.search(visible):
+        return None
+    return _INCOMPLETE_FINAL_ACTION_RE.search(visible)
+
+
+def _looks_like_workspace_file_request(text: str, intent: dict, workspace: Optional[str]) -> bool:
+    """True when a bound workspace gives the agent enough context to inspect first."""
+    if not workspace:
+        return False
+    q = str(text or "").strip()
+    if not q:
+        return False
+    domains = set(intent.get("domains") or set())
+    if "files" in domains or bool(intent.get("file_mutation")):
+        return True
+    return bool(_WORKSPACE_INSPECTION_REQUEST_RE.search(q))
+
+
+def _workspace_read_tools_available(
+    relevant_tools: Optional[Set[str]],
+    disabled_tools: Optional[Set[str]],
+) -> bool:
+    """Return true when the next round can actually inspect workspace files."""
+    disabled = set(disabled_tools or set())
+    if relevant_tools is None:
+        candidates = set(_WORKSPACE_READ_TOOL_NAMES)
+    else:
+        candidates = set(relevant_tools) & _WORKSPACE_READ_TOOL_NAMES
+    return bool(candidates - disabled)
+
+
+def _has_workspace_file_tool_event(tool_events: list) -> bool:
+    return any(str(event.get("tool") or "").lower() in _WORKSPACE_FILE_TOOL_NAMES for event in tool_events)
+
+
+def _has_successful_workspace_read_file_event(tool_events: list) -> bool:
+    for event in tool_events or []:
+        if str(event.get("tool") or "").lower() != "read_file":
+            continue
+        if event.get("exit_code") not in (None, 0):
+            continue
+        output = str(event.get("output") or "").strip()
+        if output and not _WORKSPACE_TARGET_NOT_FOUND_RE.search(output):
+            return True
+    return False
+
+
+def _has_workspace_target_not_found_event(tool_events: list, target_hint: str) -> bool:
+    hint = str(target_hint or "").lower()
+    for event in tool_events or []:
+        if str(event.get("tool") or "").lower() not in _WORKSPACE_READ_TOOL_NAMES:
+            continue
+        text = f"{event.get('command') or ''}\n{event.get('output') or ''}".lower()
+        if hint and hint not in text:
+            continue
+        if event.get("exit_code") not in (None, 0) or _WORKSPACE_TARGET_NOT_FOUND_RE.search(text):
+            return True
+    return False
+
+
+def _find_incomplete_workspace_target_lookup(
+    text: str,
+    user_text: str,
+    intent: dict,
+    workspace: Optional[str],
+    tool_events: list,
+    relevant_tools: Optional[Set[str]],
+    disabled_tools: Optional[Set[str]],
+) -> Optional[re.Match]:
+    """Detect incomplete workspace target lookup after an obvious miss.
+
+    Example: for a generic "read the README" request, trying only
+    ``README.md`` and then asking the user to paste content is incomplete when
+    the active workspace can still be listed or globbed for ``README*``.
+    """
+    if not _looks_like_workspace_file_request(user_text, intent, workspace):
+        return None
+    if not _workspace_read_tools_available(relevant_tools, disabled_tools):
+        return None
+    if _has_successful_workspace_read_file_event(tool_events):
+        return None
+
+    visible = strip_tool_blocks(text or "").strip()
+    visible = re.sub(r"<think>.*?</think>", "", visible, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not visible or "```" in visible or len(visible) > 1800:
+        return None
+
+    failure_match = _WORKSPACE_TARGET_FAILURE_RE.search(visible)
+    if failure_match is None:
+        return None
+
+    generic_readme_request = (
+        _GENERIC_README_REQUEST_RE.search(user_text or "") is not None
+        and _EXPLICIT_README_PATH_RE.search(user_text or "") is None
+    )
+    if generic_readme_request:
+        if _has_workspace_target_not_found_event(tool_events, "readme"):
+            return failure_match
+        if not _has_workspace_file_tool_event(tool_events):
+            return failure_match
+        return None
+
+    if not _has_workspace_file_tool_event(tool_events):
+        return failure_match
+    return None
+
+
+def _find_avoidable_workspace_clarification(
+    text: str,
+    user_text: str,
+    intent: dict,
+    workspace: Optional[str],
+    tool_events: list,
+    relevant_tools: Optional[Set[str]],
+    disabled_tools: Optional[Set[str]],
+) -> Optional[re.Match]:
+    """Detect clarification that should have been preceded by workspace inspection."""
+    if not _looks_like_workspace_file_request(user_text, intent, workspace):
+        return None
+    if _has_workspace_file_tool_event(tool_events):
+        return None
+    if not _workspace_read_tools_available(relevant_tools, disabled_tools):
+        return None
+
+    visible = strip_tool_blocks(text or "").strip()
+    visible = re.sub(r"<think>.*?</think>", "", visible, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not visible or "```" in visible or len(visible) > 1600:
+        return None
+    return _WORKSPACE_CLARIFICATION_RE.search(visible)
+
+
+def _is_workspace_shell_write_block_event(event: dict) -> bool:
+    """True for the deliberate active-workspace shell-write policy block."""
+    if not isinstance(event, dict):
+        return False
+    if str(event.get("tool") or "").lower() != "bash":
+        return False
+    if event.get("exit_code") != 1:
+        return False
+    text = f"{event.get('output') or ''}\n{event.get('command') or ''}"
+    return (
+        "Workspace file changes must use" in text
+        and "write_file" in text
+        and "edit_file" in text
+    )
+
+
+def _is_successful_file_mutation_event(event: dict) -> bool:
+    if not isinstance(event, dict):
+        return False
+    if event.get("exit_code") not in (None, 0):
+        return False
+    return str(event.get("tool") or "").lower() in {"write_file", "edit_file"}
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -2336,6 +2693,8 @@ async def stream_agent_loop(
       - data: {"delta": "text"}                             (text chunks)
       - data: {"type": "tool_start", "tool": "...", ...}    (before execution)
       - data: {"type": "tool_output", "tool": "...", ...}   (after execution)
+      - data: {"type": "agent_process", "round": N, ...}    (round text before tools)
+      - data: {"type": "agent_final", "round": N, ...}      (final no-tool answer)
       - data: {"type": "agent_step", "round": N}            (next round)
       - data: {"type": "metrics", "data": {...}}            (final metrics)
       - data: [DONE]                                        (end)
@@ -2392,10 +2751,11 @@ async def stream_agent_loop(
     # user turns only for explicit continuations ("yes", "do it", "1").
     _retrieval_query = str(_intent.get("retrieval_query") or _last_user)
     logger.info(
-        "[agent-intent] latest=%r continuation=%s low_signal=%s domains=%s active_doc_relevant=%s retrieval_query=%r",
+        "[agent-intent] latest=%r continuation=%s low_signal=%s file_mutation=%s domains=%s active_doc_relevant=%s retrieval_query=%r",
         _last_user[:120],
         bool(_intent.get("continuation")),
         _low_signal_turn,
+        bool(_intent.get("file_mutation")),
         sorted(_intent.get("domains") or []),
         _active_document_relevant,
         _retrieval_query[:200],
@@ -2403,7 +2763,19 @@ async def stream_agent_loop(
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
     if _direct_low_signal:
         logger.info("[agent] direct low-signal reply path for latest=%r", _last_user[:80])
-        direct_messages = [{"role": "user", "content": _last_user}]
+        direct_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "## FINAL ANSWER CONTRACT\n"
+                    "After tool work is complete and no more tools are needed, write only the final answer for the user.\n"
+                    "- Keep the final answer concise by default, even if the solving phase used high reasoning or verbosity.\n"
+                    "- Do not replay tool commands, raw logs, or earlier failed attempts unless the user explicitly asks for process details.\n"
+                    "- Prefer 1-4 sentences or a short bullet list. If blocked, state the exact blocker and the next useful action."
+                ),
+            },
+            {"role": "user", "content": _last_user},
+        ]
         direct_response = ""
         direct_start = time.time()
         direct_actual_model = model
@@ -2698,6 +3070,12 @@ async def stream_agent_loop(
             _db.close()
     except Exception as _e:
         logger.debug(f"endpoint supports_tools lookup failed: {_e}")
+    try:
+        from src.chatgpt_subscription import is_chatgpt_subscription_base as _is_chatgpt_subscription_base
+        if _is_chatgpt_subscription_base(endpoint_url or ""):
+            _endpoint_supports = True
+    except Exception:
+        pass
     _model_supports_tools = any(kw in _model_lc for kw in (
         "gpt-4", "gpt-5", "gpt-o", "claude", "gemini", "gemma",
         "qwen3", "qwen2.5", "mixtral", "mistral", "llama-3.1", "llama-3.2",
@@ -2751,6 +3129,7 @@ async def stream_agent_loop(
         compact=_compact_agent_prompt,
         owner=owner,
         suppress_local_context=guide_only,
+        workspace=workspace,
         suppress_skills=_low_signal_turn,
         active_email=active_email,
     )
@@ -2894,10 +3273,17 @@ async def stream_agent_loop(
     _call_freq: collections.Counter = collections.Counter()
     _force_answer = False  # set by loop-breaker → next round runs with NO tools
     # Supervisor: how many times we've nudged the model after it announced
-    # an action without emitting the tool call. Capped to prevent a model
-    # that *can't* call the tool from looping forever.
+    # an action without doing it. Capped so weak models cannot loop forever.
     _intent_nudge_count = 0
-    _MAX_INTENT_NUDGES = 2
+    _workspace_shell_write_recovery_pending = False
+    _workspace_shell_write_blocked_seen = False
+    _workspace_shell_write_recovery_nudges = 0
+    _empty_response_retries = 0
+    _empty_response_seen = False
+    _empty_response_failed = False
+    _workspace_clarification_nudges = 0
+    _workspace_target_recovery_pending = False
+    _workspace_target_recovery_nudges = 0
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -2906,16 +3292,6 @@ async def stream_agent_loop(
     # Match the common phrasings + an action verb that maps to an available
     # tool, so we don't nudge on harmless transitional text like "let me
     # know what you think".
-    _INTENT_RE = re.compile(
-        r"(?:^|\n)\s*(?:let me|i'?ll|i will|i need to|we need to|need to|"
-        r"i should|we should|i must|we must|going to|let's)\s+"
-        r"(?:tail|check|investigate|look at|see|tail|read|fetch|inspect|"
-        r"verify|diagnose|examine|debug|capture|grab|pull|view|run|call|"
-        r"trigger|launch|start|kick off|stop|kill|restart|adopt|serve|"
-        r"register|adopt|list|search|find|query|hit|ping|test|use|perform|do)"
-        r"\b[^.\n]{0,140}",
-        re.IGNORECASE,
-    )
     _awaiting_user = False  # set by ask_user → end the turn and wait for a choice
 
     # Document streaming state (persists across rounds)
@@ -2985,6 +3361,17 @@ async def stream_agent_loop(
                     t for t in all_tool_schemas
                     if t.get("function", {}).get("name") not in disabled_tools
                     and t.get("name") not in disabled_tools
+                ]
+            if _workspace_shell_write_recovery_pending:
+                all_tool_schemas = [
+                    t for t in all_tool_schemas
+                    if _tool_schema_name(t) in _WORKSPACE_FILE_TOOL_RECOVERY_TOOLS
+                ]
+            elif _workspace_target_recovery_pending:
+                all_tool_schemas = [
+                    t for t in (FUNCTION_TOOL_SCHEMAS + mcp_schemas)
+                    if _tool_schema_name(t) in _WORKSPACE_TARGET_RECOVERY_TOOLS
+                    and _tool_schema_name(t) not in disabled_tools
                 ]
         else:
             # Local: only MCP schemas when message suggests MCP tool usage
@@ -3367,7 +3754,175 @@ async def stream_agent_loop(
             # the model fix them (capped, and it must do new effectful work
             # to re-trigger). Skipped on force-answer rounds (no tools to
             # fix with), pure Q&A, and when the toggle is off.
-            _claimed_done = bool(_strip_think_blocks(cleaned_round).strip())
+            _visible_round = _strip_think_blocks(cleaned_round).strip()
+            _claimed_done = bool(_visible_round)
+            if (
+                not _claimed_done
+                and not _force_answer
+                and _empty_response_retries < _MAX_EMPTY_RESPONSE_RETRIES
+                and round_num < max_rounds
+            ):
+                _empty_response_seen = True
+                _empty_response_retries += 1
+                logger.info(
+                    "[agent] empty-response retry #%d on round %d",
+                    _empty_response_retries,
+                    round_num,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The previous model round produced no user-visible answer "
+                        "and no tool call. That empty response cannot complete the "
+                        "turn. In this next round, either call the needed tool, "
+                        "write the final answer directly, or state the exact blocker "
+                        "in one sentence. Do not output only reasoning or empty text."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+            if not _claimed_done and not _force_answer:
+                _empty_response_seen = True
+                _empty_response_failed = True
+                _empty_failure = (
+                    "The model returned an empty response, so I couldn't complete "
+                    "this agent turn. Please try again or switch models."
+                )
+                logger.warning(
+                    "[agent] empty response persisted after %d retry round(s); "
+                    "emitting failure final on round %d",
+                    _empty_response_retries,
+                    round_num,
+                )
+                if round_texts:
+                    round_texts[-1] = _empty_failure
+                else:
+                    round_texts.append(_empty_failure)
+                yield f'data: {json.dumps({"delta": _empty_failure})}\n\n'
+                full_response += _empty_failure
+                yield f'data: {json.dumps({"type": "agent_final", "round": round_num, "text": _empty_failure})}\n\n'
+                break
+            if (
+                _workspace_shell_write_recovery_pending
+                and not _force_answer
+                and not guide_only
+                and _workspace_shell_write_recovery_nudges < _MAX_WORKSPACE_SHELL_WRITE_RECOVERY_NUDGES
+            ):
+                _workspace_shell_write_recovery_nudges += 1
+                logger.info(
+                    "[agent] workspace shell-write recovery nudge #%d on round %d",
+                    _workspace_shell_write_recovery_nudges,
+                    round_num,
+                )
+                if cleaned_round:
+                    yield f'data: {json.dumps({"type": "agent_process", "round": round_num, "text": cleaned_round})}\n\n'
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The previous `bash` command was blocked because an active "
+                        "workspace requires file changes through `read_file`, "
+                        "`write_file`, or `edit_file`. The user's workspace file "
+                        "request is NOT complete yet. Do not answer with a plan, "
+                        "promise, or instructions for the user to run. In this next "
+                        "round, either call the file tools to complete and verify the "
+                        "requested file change, or if a file tool fails, report that "
+                        "exact file-tool failure. For copy/create/append requests: "
+                        "read the source file if needed, write the target file with "
+                        "the full desired contents, then read the target before the "
+                        "final answer."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+            _workspace_clarification_match = _find_avoidable_workspace_clarification(
+                _visible_round,
+                _last_user,
+                _intent,
+                workspace,
+                tool_events,
+                _relevant_tools,
+                disabled_tools,
+            )
+            if (
+                _workspace_clarification_match is not None
+                and not _force_answer
+                and not guide_only
+                and _workspace_clarification_nudges < _MAX_WORKSPACE_CLARIFICATION_NUDGES
+                and round_num < max_rounds
+            ):
+                _workspace_clarification_nudges += 1
+                logger.info(
+                    "[agent] avoidable workspace clarification nudge #%d on round %d: %r",
+                    _workspace_clarification_nudges,
+                    round_num,
+                    _workspace_clarification_match.group(0).strip()[:200],
+                )
+                if cleaned_round:
+                    yield f'data: {json.dumps({"type": "agent_process", "round": round_num, "text": cleaned_round})}\n\n'
+                _ws_prompt = str(workspace or "").replace("`", "\\`")
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The previous round asked for workspace/file clarification "
+                        "before inspecting the active workspace. A workspace is "
+                        f"already bound at `{_ws_prompt}`. Do not ask which file, "
+                        "folder, path, project, or README before trying the "
+                        "available read-only workspace tools. In this next round, "
+                        "call `get_workspace`, `ls`, `glob`, `grep`, or `read_file` "
+                        "to inspect the workspace first. Then answer from what you "
+                        "find, or ask one precise clarification only if inspection "
+                        "still leaves multiple plausible targets. If the user asked "
+                        "for a write/edit/delete and the target is still ambiguous "
+                        "after inspection, ask before mutating files."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+            _workspace_target_match = _find_incomplete_workspace_target_lookup(
+                _visible_round,
+                _last_user,
+                _intent,
+                workspace,
+                tool_events,
+                _relevant_tools,
+                disabled_tools,
+            )
+            if (
+                _workspace_target_match is not None
+                and not _force_answer
+                and not guide_only
+                and _workspace_target_recovery_nudges < _MAX_WORKSPACE_TARGET_RECOVERY_NUDGES
+                and round_num < max_rounds
+            ):
+                _workspace_target_recovery_nudges += 1
+                _workspace_target_recovery_pending = True
+                logger.info(
+                    "[agent] incomplete workspace target lookup nudge #%d on round %d: %r",
+                    _workspace_target_recovery_nudges,
+                    round_num,
+                    _workspace_target_match.group(0).strip()[:200],
+                )
+                if cleaned_round:
+                    yield f'data: {json.dumps({"type": "agent_process", "round": round_num, "text": cleaned_round})}\n\n'
+                _ws_prompt = str(workspace or "").replace("`", "\\`")
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The previous round stopped after an incomplete active-workspace "
+                        "target lookup. A workspace is already bound at "
+                        f"`{_ws_prompt}`. Do not ask the user to paste file contents, "
+                        "and do not stop after trying one guessed path such as "
+                        "`README.md`. In this next round, use read-only workspace "
+                        "tools to finish the lookup: call `get_workspace` if needed, "
+                        "then `ls`, `glob`, `grep`, or `read_file`. For a generic "
+                        "README request, search for `README*` / `readme*` and read "
+                        "the best root-level match such as `README.txt` or "
+                        "`README.md`. If inspection still finds multiple equally "
+                        "plausible targets, ask one precise clarification."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
             if (_effectful_used and not _force_answer
                     and _claimed_done
                     and _verifier_rounds < _VERIFIER_MAX_ROUNDS
@@ -3387,6 +3942,8 @@ async def stream_agent_loop(
                     _verifier_rounds += 1
                     logger.info(f"[agent] verifier flagged {len(_vfail)} issue(s) on round {round_num}: {_vfail}")
                     _note = "\n\n_Double-checked the work and found something to fix._\n\n"
+                    if cleaned_round:
+                        yield f'data: {json.dumps({"type": "agent_process", "round": round_num, "text": cleaned_round})}\n\n'
                     yield f'data: {json.dumps({"delta": _note})}\n\n'
                     full_response += _note
                     messages.append({
@@ -3411,8 +3968,8 @@ async def stream_agent_loop(
             # actual tool now") and loop again. Capped at
             # _MAX_INTENT_NUDGES so a model that genuinely cannot use the
             # tool doesn't pin us in a forever loop.
-            _intent_text = _strip_think_blocks(cleaned_round).strip()
-            _intent_match = _INTENT_RE.search(_intent_text) if _intent_text else None
+            _intent_text = _visible_round
+            _intent_match = _find_incomplete_final_promise(_intent_text) if _intent_text else None
             # Only nudge when the round REALLY looks like an unfinished
             # promise: short response (<400 chars), no fenced code/answer,
             # and an action-intent phrase was matched. Long answers that
@@ -3420,14 +3977,14 @@ async def stream_agent_loop(
             _looks_like_promise = (
                 not guide_only
                 and _intent_match is not None
-                and len(_intent_text) < 400
-                and "```" not in _intent_text
-                and _intent_nudge_count < _MAX_INTENT_NUDGES
+                and _intent_nudge_count < _MAX_INCOMPLETE_FINAL_NUDGES
             )
             if _looks_like_promise:
                 _intent_nudge_count += 1
                 _matched_phrase = _intent_match.group(0).strip()
                 logger.info(f"[agent] intent-without-action nudge #{_intent_nudge_count} on round {round_num}: {_matched_phrase!r}")
+                if cleaned_round:
+                    yield f'data: {json.dumps({"type": "agent_process", "round": round_num, "text": cleaned_round})}\n\n'
                 _lower_phrase = _matched_phrase.lower()
                 _cookbook_log_hint = ""
                 if any(_word in _lower_phrase for _word in ("log", "logs", "output", "tail", "status")):
@@ -3443,7 +4000,7 @@ async def stream_agent_loop(
                         f"You just wrote: \"{_matched_phrase}\" — but ended the "
                         "turn without making the actual tool call. The user can "
                         "see you announced the action but didn't run it, which "
-                        "is the most frustrating thing you can do. "
+                        "is an unfinished promise or plan. "
                         "DO IT NOW: emit the actual function call this turn. "
                         f"{_cookbook_log_hint}"
                         "If you decided not to do it after all, say so plainly in "
@@ -3453,6 +4010,8 @@ async def stream_agent_loop(
                 # Visible signal in the stream so the user knows we caught it.
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
+            if cleaned_round:
+                yield f'data: {json.dumps({"type": "agent_final", "round": round_num, "text": cleaned_round})}\n\n'
             break  # no tools — done
 
         # ── Loop-breaker (Terminus-style stall detector) ──────────────
@@ -3466,6 +4025,9 @@ async def stream_agent_loop(
         # runaway backstop). On bail we don't give up — we force one
         # tool-free round so the model declares done or declares blocked,
         # mirroring Terminus's explicit-completion handshake.
+        if cleaned_round:
+            yield f'data: {json.dumps({"type": "agent_process", "round": round_num, "text": cleaned_round})}\n\n'
+
         _sig = "|".join(sorted(f"{b.tool_type}:{(b.content or '').strip()[:120]}" for b in tool_blocks))
         _is_repeat = _sig in _recent_call_sigs
         _recent_call_sigs.append(_sig)
@@ -3775,7 +4337,7 @@ async def stream_agent_loop(
                 output_text = _truncate(result["error"])
 
             # Emit tool_output (include ui_event data if present)
-            tool_output_data = {"type": "tool_output", "tool": block.tool_type, "command": cmd_display, "output": output_text, "exit_code": result.get("exit_code")}
+            tool_output_data = {"type": "tool_output", "tool": block.tool_type, "command": cmd_display, "output": output_text, "exit_code": result.get("exit_code"), "round": round_num}
             if is_doc_tool and "action" in result:
                 tool_output_data.update({
                     "doc_id": result.get("doc_id"),
@@ -3890,6 +4452,19 @@ async def stream_agent_loop(
                 # message removes it as answered.
                 tool_event["ask_user"] = _pending_ask_user_event
             tool_events.append(tool_event)
+            if _is_workspace_shell_write_block_event(tool_event):
+                _workspace_shell_write_recovery_pending = True
+                _workspace_shell_write_blocked_seen = True
+            elif (
+                _workspace_shell_write_recovery_pending
+                and _is_successful_file_mutation_event(tool_event)
+            ):
+                _workspace_shell_write_recovery_pending = False
+            if (
+                _workspace_target_recovery_pending
+                and str(tool_event.get("tool") or "").lower() in _WORKSPACE_READ_TOOL_NAMES
+            ):
+                _workspace_target_recovery_pending = False
             if block.tool_type in _VERIFIER_EFFECTFUL_TOOLS:
                 _effectful_used = True
 
@@ -3986,6 +4561,46 @@ async def stream_agent_loop(
         backend_prefill_tps=backend_prefill_tps,
     )
     metrics["requested_model"] = requested_model
+    metrics["agent_limits"] = {
+        "max_rounds": max_rounds,
+        "max_tool_calls": max_tool_calls,
+        "rounds_used": len(round_texts),
+        "tool_calls_used": total_tool_calls,
+        "verifier_enabled": bool(get_setting("agent_verifier_subagent", False)),
+        "verifier_max_rounds": _VERIFIER_MAX_ROUNDS,
+        "workspace_bound": bool(workspace),
+        "workspace_path": str(workspace or ""),
+        "workspace_label": _workspace_display_label(workspace),
+        "workspace_shell_writes_blocked": bool(workspace),
+    }
+    if _workspace_shell_write_blocked_seen:
+        metrics["agent_workspace_shell_write_recovery"] = {
+            "blocked_shell_write": True,
+            "nudges": _workspace_shell_write_recovery_nudges,
+            "pending": _workspace_shell_write_recovery_pending,
+        }
+    if _intent_nudge_count:
+        metrics["agent_incomplete_final_recovery"] = {
+            "nudges": _intent_nudge_count,
+            "max_nudges": _MAX_INCOMPLETE_FINAL_NUDGES,
+        }
+    if _empty_response_seen:
+        metrics["agent_empty_response_recovery"] = {
+            "retries": _empty_response_retries,
+            "max_retries": _MAX_EMPTY_RESPONSE_RETRIES,
+            "failed": _empty_response_failed,
+        }
+    if _workspace_clarification_nudges:
+        metrics["agent_workspace_clarification_recovery"] = {
+            "nudges": _workspace_clarification_nudges,
+            "max_nudges": _MAX_WORKSPACE_CLARIFICATION_NUDGES,
+        }
+    if _workspace_target_recovery_nudges:
+        metrics["agent_workspace_target_recovery"] = {
+            "nudges": _workspace_target_recovery_nudges,
+            "max_nudges": _MAX_WORKSPACE_TARGET_RECOVERY_NUDGES,
+            "pending": _workspace_target_recovery_pending,
+        }
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
 
     # Teacher-escalation: inline takeover visible in the chat stream.

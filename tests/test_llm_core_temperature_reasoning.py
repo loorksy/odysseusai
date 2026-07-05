@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from src import llm_core
+from src import chatgpt_subscription
 
 
 @pytest.mark.parametrize(
@@ -109,3 +110,98 @@ def test_chatgpt_subscription_payload_omits_max_output_tokens_when_zero():
     )
 
     assert "max_output_tokens" not in payload
+
+
+def test_chatgpt_subscription_payload_converts_function_tools():
+    payload = llm_core._build_chatgpt_responses_payload(
+        "gpt-5.3-codex-spark",
+        [{"role": "user", "content": "Read the README"}],
+        temperature=0.2,
+        max_tokens=0,
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }],
+    )
+
+    assert payload["tools"] == [{
+        "type": "function",
+        "name": "read_file",
+        "description": "Read a file",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }]
+
+
+def test_chatgpt_subscription_input_preserves_native_tool_turns():
+    items = chatgpt_subscription.build_responses_input([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_read",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path": "/workspace/README.txt"}',
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_read",
+            "content": "README contents",
+        },
+    ])
+
+    assert items == [
+        {
+            "type": "function_call",
+            "call_id": "call_read",
+            "name": "read_file",
+            "arguments": '{"path": "/workspace/README.txt"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_read",
+            "output": "README contents",
+        },
+    ]
+
+
+def _anthropic_payload(temperature):
+    return llm_core._build_anthropic_payload(
+        "claude-3-5-sonnet",
+        [{"role": "user", "content": "Hi"}],
+        temperature,
+        max_tokens=5,
+    )
+
+
+def test_anthropic_payload_clamps_above_one():
+    # Anthropic rejects temperature > 1.0 (e.g. the Nietzsche preset's 1.2).
+    assert _anthropic_payload(1.2)["temperature"] == 1.0
+
+
+def test_anthropic_payload_keeps_in_range():
+    assert _anthropic_payload(0.7)["temperature"] == 0.7
+
+
+def test_anthropic_payload_clamps_negative():
+    assert _anthropic_payload(-0.5)["temperature"] == 0.0
+
+
+def test_anthropic_payload_none_temperature_does_not_crash():
+    payload = _anthropic_payload(None)
+    assert payload["temperature"] is None

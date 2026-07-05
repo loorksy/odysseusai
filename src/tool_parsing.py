@@ -61,6 +61,8 @@ def _fenced_tool_call(m) -> Optional[Tuple[str, str]]:
     inline = (m.group(2) or "").strip()
     body = (m.group(3) or "").strip()
     if not inline:
+        if not body and tag not in BUILTIN_EMAIL_TOOLS and tag not in _ZERO_ARG_FENCED_TOOLS:
+            return None
         return tag, body
     if tag in _CODE_FENCE_TAGS:
         return None
@@ -314,6 +316,10 @@ _RAW_WEB_JSON_TOOL_RE = re.compile(
     re.IGNORECASE,
 )
 _RAW_WEB_JSON_ALLOWED_KEYS = {"query", "queries", "time_filter", "freshness", "max_pages"}
+
+# Some tools intentionally take no arguments. Empty fenced blocks are usually a
+# model formatting mistake, but these are real executable calls.
+_ZERO_ARG_FENCED_TOOLS = {"get_workspace"}
 
 # Narrow rescue for models that ignore native tool calling and print the UI
 # command as plain text. Keep this intentionally tiny: open-panel is a harmless
@@ -1037,9 +1043,10 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
                 # local models really emit for no-arg tools. Dispatch with
                 # empty args and let the tool's own validation answer;
                 # silently dropping the call left models concluding email was
-                # broken. Other tags (bash, python, ...) keep skipping: empty
-                # content is nothing to run.
-                if tag in BUILTIN_EMAIL_TOOLS:
+                # broken. get_workspace is also intentionally zero-arg.
+                # Other tags (bash, python, ...) keep skipping: empty content
+                # is nothing to run.
+                if tag in BUILTIN_EMAIL_TOOLS or tag in _ZERO_ARG_FENCED_TOOLS:
                     blocks.append(ToolBlock(tag, ""))
                 continue
             # If a code block's content is an <invoke> XML call (some models wrap

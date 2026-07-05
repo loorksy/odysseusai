@@ -81,7 +81,9 @@ def test_empty_email_fence_is_an_executable_call():
 def test_empty_non_email_fence_still_skipped():
     # Empty bash/python/other fences stay inert: empty content is nothing to run.
     for tag in ("bash", "python", "manage_memory"):
-        assert parse_tool_blocks(f'```{tag}\n```') == []
+        text = f'```{tag}\n```'
+        assert parse_tool_blocks(text) == []
+        assert strip_tool_blocks(text) == text
 
 
 def test_empty_email_fence_is_stripped_from_display():
@@ -159,11 +161,8 @@ def test_markdown_info_string_fence_is_left_intact_in_display():
 
 def test_parse_strip_mirror_across_fence_shape_grid():
     # Invariant for ANY single fence: either it executes AND is stripped, or
-    # it doesn't execute AND stays fully visible. The one allowed exception is
-    # an empty NON-EMAIL tool fence (no header, no body): never executed, but
-    # stripped as noise — pre-PR behavior, kept deliberately. (Empty EMAIL
-    # fences execute with empty args, so they fall under the first branch.)
-    from src.agent_tools import TOOL_TAGS
+    # it doesn't execute AND stays fully visible. Empty EMAIL and get_workspace
+    # fences execute with empty args, so they fall under the first branch.
 
     tags = ["bash", "python", "list_emails", "bulk_email", "manage_memory",
             "python3", "bash-session", "notatool"]
@@ -180,7 +179,5 @@ def test_parse_strip_mirror_across_fence_shape_grid():
                 case = (tag, header, body)
                 if blocks:
                     assert stripped == "before\n\nafter", case
-                elif stripped != text:
-                    assert (
-                        tag in TOOL_TAGS and not header.strip() and not body.strip()
-                    ), f"non-executed fence was stripped: {case}"
+                else:
+                    assert stripped == text, f"non-executed fence was stripped: {case}"

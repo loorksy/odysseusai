@@ -37,6 +37,7 @@ try:
     from src.agent_loop import (
         _detect_admin_intent,
         _classify_agent_request,
+        _workspace_display_label,
         _compute_final_metrics,
         _append_tool_results,
         _insert_before_latest_user,
@@ -72,6 +73,47 @@ def test_polish_internet_search_request_classifies_as_web():
 
     assert intent["low_signal"] is False
     assert "web" in intent["domains"]
+
+
+def test_workspace_copy_request_classifies_as_file_mutation():
+    intent = _classify_agent_request([], "Copy README.txt to README_copy.txt")
+
+    assert intent["low_signal"] is False
+    assert intent["file_mutation"] is True
+    assert "files" in intent["domains"]
+    assert "documents" not in intent["domains"]
+
+
+def test_readme_append_request_classifies_as_file_mutation():
+    intent = _classify_agent_request([], "Append 'This is a test' to the README")
+
+    assert intent["low_signal"] is False
+    assert intent["file_mutation"] is True
+    assert "files" in intent["domains"]
+
+
+def test_plain_writing_request_stays_document_or_chat_not_file_mutation():
+    intent = _classify_agent_request([], "Write a poem about winter")
+
+    assert intent["file_mutation"] is False
+    assert "documents" in intent["domains"]
+    assert "files" not in intent["domains"]
+
+
+def test_chat_rename_request_does_not_become_file_mutation():
+    intent = _classify_agent_request([], "Rename chat to Agent test")
+
+    assert intent["file_mutation"] is False
+    assert "sessions" in intent["domains"]
+    assert "files" not in intent["domains"]
+
+
+def test_workspace_display_label_maps_default_mount(monkeypatch):
+    monkeypatch.setenv("ODYSSEUS_DEFAULT_WORKSPACE", "/workspace")
+    monkeypatch.setenv("ODYSSEUS_WORKSPACE_LABEL", r"D:\Odysseus_Workspace")
+
+    assert _workspace_display_label("/workspace") == r"D:\Odysseus_Workspace (mounted as /workspace)"
+    assert _workspace_display_label("/tmp/other") == "/tmp/other"
 
 
 def test_insert_before_latest_user_places_context_before_last_user_turn():
