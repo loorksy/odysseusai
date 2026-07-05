@@ -16,6 +16,7 @@ from src.endpoint_resolver import normalize_base
 from src.context_compactor import maybe_compact, trim_for_context
 from src.auth_helpers import effective_user
 from src.prompt_security import untrusted_context_message
+from src.settings import get_setting
 from routes.prefs_routes import _load_for_user as load_prefs_for_user
 
 from fastapi import HTTPException
@@ -33,6 +34,24 @@ _CASUAL_BLOCKLIST_RE = re.compile(
     r"file|folder|repo|git|settings?|endpoint|api|token|mcp)\b",
     re.IGNORECASE,
 )
+
+
+MEMORY_RECALL_COUNT_MIN = 1
+MEMORY_RECALL_COUNT_MAX = 50
+
+
+def resolve_memory_recall_count(uprefs: dict) -> int:
+    """Number of extended memories recalled into context per response (issue #4948).
+
+    Resolves user pref -> global setting -> the historical default of 3, coerces to
+    int, and clamps to [1, 50] so a malformed pref (NaN, negative, string, null)
+    can't silently disable recall (k<=0) or balloon the prompt.
+    """
+    try:
+        count = int(uprefs.get("memory_recall_count", get_setting("memory_recall_count", 3)))
+    except (TypeError, ValueError):
+        count = 3
+    return max(MEMORY_RECALL_COUNT_MIN, min(MEMORY_RECALL_COUNT_MAX, count))
 
 
 def _is_casual_low_signal(text: str) -> bool:
@@ -681,6 +700,7 @@ async def build_chat_context(
     # Skills injection respects its own enable toggle (mirrors memory_enabled).
     # When off, the "Available skills" index is not added to the prompt.
     skills_enabled = not incognito and uprefs.get("skills_enabled", True)
+    mem_recall_count = resolve_memory_recall_count(uprefs)
     if not allow_tool_preprocessing:
         mem_enabled = False
         skills_enabled = False
@@ -724,6 +744,7 @@ async def build_chat_context(
         agent_mode=agent_mode,
         incognito=incognito,
         use_skills=skills_enabled,
+        mem_recall_count=mem_recall_count,
     )
     if use_rag is not None or is_research_spinoff or casual_low_signal:
         _preface_kwargs["use_rag"] = use_rag_val
