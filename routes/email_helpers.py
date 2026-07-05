@@ -1182,7 +1182,21 @@ def _decode_header(raw):
         # whitespace), and the whitespace between two adjacent encoded-words is
         # dropped. The old " ".join produced "Re:  Jose"-style double spaces on
         # every non-ASCII subject or sender.
-        return str(email.header.make_header(email.header.decode_header(raw)))
+        decoded_parts = email.header.decode_header(raw)
+        fixed_parts = []
+        for data, charset in decoded_parts:
+            # Many automated systems inject raw UTF-8 into headers instead of RFC 2047 encoding them.
+            # Python's email parser flags these as 'unknown-8bit'.
+            # make_header() silently replaces 'unknown-8bit' bytes with \ufffd, turning emojis into ????.
+            # We intercept 'unknown-8bit' and try to decode as UTF-8.
+            if charset == 'unknown-8bit' and isinstance(data, bytes):
+                try:
+                    data.decode('utf-8')
+                    charset = 'utf-8'
+                except UnicodeDecodeError:
+                    pass
+            fixed_parts.append((data, charset))
+        return str(email.header.make_header(fixed_parts))
     except Exception:
         # Malformed header or unknown/invalid MIME charset (e.g. a spam header
         # like =?x-unknown-charset?B?...?=) makes make_header raise LookupError;
