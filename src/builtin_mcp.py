@@ -12,6 +12,9 @@ import os
 import shutil
 import subprocess
 import sys
+import asyncio
+from pathlib import Path
+import importlib
 
 from core.platform_compat import IS_WINDOWS, which_tool
 from src.runtime_paths import get_app_root
@@ -74,6 +77,7 @@ _BUILTIN_SERVERS = {
     "memory":     ("mcp_servers/memory_server.py",     "Built-in: Memory"),
     "rag":        ("mcp_servers/rag_server.py",        "Built-in: RAG"),
     "email":      ("mcp_servers/email_server.py",      "Built-in: Email"),
+    "router":('mcp_servers/pydantic_router.py', "Built-in: Router")
 }
 
 # NPX-based built-in servers (run via npx, not Python)
@@ -260,6 +264,31 @@ async def _is_npx_package_cached(npx_path, package_spec, timeout_s=5):
     return proc.returncode == 0 and bool(stdout.strip())
 
 
+async def RouterCaller(prompt, Agent_Hashmap:dict, AgentSystemPrompt, model, args:dict, ToolSystemPrompt):
+   '''The tool names are provided to the agent by default.'''
+   try:
+    TARGET_DIR = (Path(__file__).parent / ".." / "mcp_servers"/'pydantic_router.py').resolve().as_posix()
+
+# 2. Tell Python to temporarily add that directory to its search path
+    spec = importlib.util.spec_from_file_location("pydantic_router", TARGET_DIR)
+    pydantic_router = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pydantic_router)
+    result = await pydantic_router.routeMCP(
+        prompt=prompt,
+        Agent_Hashmap=Agent_Hashmap,
+        AgentSystemPrompt = AgentSystemPrompt,
+        ToolSystemPrompt = ToolSystemPrompt,  # Maps the required prompt parameter
+        model=model,
+        args=args
+    )
+    return result
+
+   except ModuleNotFoundError as e:
+       logger.error(f"Router dependency missing")
+       return f'packages for router have not been installed:{e}'
+   except Exception as e:
+       logger.exception("Critical error from router")
+       return f'The router crashed with an error:{e}.'
 def _is_package_in_npx_cache(package_spec):
     """Return True when npm's `_npx` cache already contains package_spec."""
     package_name = _npx_package_name(package_spec)
