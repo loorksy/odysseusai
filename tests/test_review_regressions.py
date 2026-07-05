@@ -88,6 +88,8 @@ def _install_model_route_import_stubs(monkeypatch):
     models_mod.ChatMessage = MagicMock()
     exceptions_mod = types.ModuleType("core.exceptions")
     exceptions_mod.SessionNotFoundError = type("SessionNotFoundError", (Exception,), {})
+    log_safety_mod = types.ModuleType("core.log_safety")
+    log_safety_mod.redact_url = lambda value: value
     session_mgr_mod = types.ModuleType("core.session_manager")
     session_mgr_mod.SessionManager = MagicMock()
 
@@ -100,6 +102,7 @@ def _install_model_route_import_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "python_multipart", multipart_mod)
     monkeypatch.setitem(sys.modules, "core.models", models_mod)
     monkeypatch.setitem(sys.modules, "core.exceptions", exceptions_mod)
+    monkeypatch.setitem(sys.modules, "core.log_safety", log_safety_mod)
     monkeypatch.setitem(sys.modules, "core.session_manager", session_mgr_mod)
 
 
@@ -203,6 +206,8 @@ def test_default_chat_does_not_auto_pick_shared_endpoint_for_fresh_user(monkeypa
         "endpoint_id": "",
         "endpoint_url": "",
         "model": "",
+        "default_reasoning_effort": "",
+        "default_verbosity": "",
     }
 
 
@@ -245,6 +250,8 @@ def test_default_chat_uses_owned_endpoint_as_regular_user_last_resort(monkeypatc
         "endpoint_id": "owned",
         "endpoint_url": "http://localhost:11434/chat/completions",
         "model": "owned-model",
+        "default_reasoning_effort": "",
+        "default_verbosity": "",
     }
 
 
