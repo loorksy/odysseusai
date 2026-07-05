@@ -11541,6 +11541,8 @@ textarea.memory-add-input {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
+  max-height: 100px;
+  overflow-y: auto;
 }
 
 .memory-cat-chip {
