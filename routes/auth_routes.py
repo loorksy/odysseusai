@@ -84,6 +84,15 @@ class SetOpenRegistrationRequest(BaseModel):
 SESSION_COOKIE = "odysseus_session"
 
 
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _request_from_loopback(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    return client_host in {"127.0.0.1", "::1", "localhost"}
+
+
 def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -102,6 +111,10 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(429, "Too many requests — try again later")
         if auth_manager.is_configured:
             raise HTTPException(400, "Already configured")
+        setup_token = os.getenv("ODYSSEUS_SETUP_TOKEN", "")
+        token_ok = bool(setup_token) and request.headers.get("X-Odysseus-Setup-Token") == setup_token
+        if not (_request_from_loopback(request) or token_ok or _env_true("ODYSSEUS_ALLOW_REMOTE_SETUP")):
+            raise HTTPException(403, "First-run setup is only allowed from the app host")
         if len(body.password) < PASSWORD_MIN_LENGTH:
             raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
         if len(body.username.strip()) < 1:
