@@ -3,6 +3,8 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+from urllib.parse import unquote, urlparse
 from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import TypeDecorator
@@ -10,6 +12,7 @@ from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.orm import relationship, sessionmaker, backref
 
 from src.runtime_paths import get_app_root
+from core.platform_compat import safe_chmod, IS_WINDOWS
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,49 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
 )
+
+
+# Sidecar files SQLite can create next to the main DB. -journal is the default
+# rollback journal; -wal/-shm appear once WAL is enabled. Each can hold copies of
+# secret-bearing pages, so they get the same 0o600 lockdown as the DB itself.
+_SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
+
+
+def _sqlite_db_path(url) -> Optional[str]:
+    """On-disk path of a file-backed SQLite DB for ``url``, else ``None``.
+
+    Derived from SQLAlchemy's parsed URL rather than ``str.replace`` so it stays
+    correct for driver-qualified URLs, URLs carrying query args, and SQLite URI
+    filenames such as ``file:/tmp/app.db?mode=rwc&uri=true``. Returns ``None``
+    for Postgres, in-memory, anonymous, and URI memory databases.
+    """
+    if url.get_backend_name() != "sqlite":
+        return None
+
+    db_path = url.database
+    if not db_path or db_path == ":memory:":
+        return None
+
+    query = dict(getattr(url, "query", {}) or {})
+    if str(query.get("mode", "")).lower() == "memory":
+        return None
+
+    db_path = str(db_path)
+    if not db_path.startswith("file:"):
+        return db_path
+
+    if db_path.startswith("file::memory:"):
+        return None
+
+    parsed = urlparse(db_path)
+    fs_path = parsed.path or ""
+    if not fs_path or fs_path == ":memory:":
+        return None
+
+    if parsed.netloc:
+        fs_path = f"//{parsed.netloc}{fs_path}"
+
+    return unquote(fs_path)
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -1819,6 +1865,41 @@ def init_db():
     """
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
+    # Lock the DB file (and any SQLite sidecars) to 0o600 — it holds bearer-token
+    # + bcrypt hashes and encrypted provider keys. POSIX only; safe_chmod no-ops
+    # on Windows (ACL-restricted profile dir) and the path helper returns None for
+    # Postgres / in-memory. Must stay AFTER create_all: the file is born here at
+    # the umask default, and nothing below resets the mode. The path comes from
+    # engine.url (SQLAlchemy's parsed URL), so a driver-qualified or query-tagged
+    # DATABASE_URL still resolves to the real file instead of slipping through.
+    db_path = _sqlite_db_path(engine.url)
+    if db_path is not None:
+        # Fail closed-loud on the main file: this is the only access control on
+        # it, so if the chmod genuinely fails (read-only FS, foreign owner) an
+        # operator should hear about it. safe_chmod also returns False as a
+        # Windows no-op, so guard on IS_WINDOWS to avoid a spurious warning there.
+        if not safe_chmod(db_path, 0o600) and not IS_WINDOWS:
+            logger.warning(
+                "Could not restrict %s to 0o600; it holds secrets and may be "
+                "world-readable. Check filesystem permissions and ownership.",
+                db_path,
+            )
+        # Re-lock any sidecars present at startup. New ones inherit the main
+        # file's mode (now 0o600, since we set it first), and they're usually
+        # absent here, but a stale -wal/-shm/-journal left by an older 0o644
+        # install could still expose secret pages. Absent sidecars are the
+        # normal case, not an error — only a failed chmod warrants a warning.
+        for suffix in _SQLITE_SIDECARS:
+            sidecar = db_path + suffix
+            if (
+                os.path.exists(sidecar)
+                and not safe_chmod(sidecar, 0o600)
+                and not IS_WINDOWS
+            ):
+                logger.warning(
+                    "Could not restrict %s to 0o600; it may expose DB pages.",
+                    sidecar,
+                )
     _migrate_add_hidden_models_column()
     _migrate_add_cached_models_column()
     _migrate_add_pinned_models_column()
