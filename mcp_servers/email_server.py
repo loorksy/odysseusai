@@ -1804,6 +1804,164 @@ def _download_attachment(uid, index, folder="INBOX", account=None):
     return {"path": filepath, "filename": os.path.basename(filepath), "size": size}
 
 
+def _try_pdf_ocr(pdf_bytes_io) -> str:
+    """Best-effort OCR for scanned PDFs.
+
+    Tries pdf2image+pytesseract first, then PyMuPDF page-image extraction.
+    Returns extracted text on success, or empty string if OCR is unavailable.
+    """
+    text_parts = []
+
+    try:
+        import io
+        from pdf2image import convert_from_bytes
+        import pytesseract
+        images = convert_from_bytes(pdf_bytes_io.getvalue())
+        for i, img in enumerate(images):
+            text_parts.append(f"--- Page {i+1} ---\n" + (pytesseract.image_to_string(img) or ""))
+        return "\n".join(text_parts).strip()
+    except Exception:
+        pass
+
+    try:
+        import io
+        pdf_bytes_io.seek(0)
+        import fitz
+        doc = fitz.open(stream=pdf_bytes_io.getvalue(), filetype="pdf")
+        for i in range(len(doc)):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(dpi=200)
+            img_data = pix.tobytes("png")
+            try:
+                import pytesseract
+                from PIL import Image
+                text_parts.append(f"--- Page {i+1} ---\n" + (pytesseract.image_to_string(Image.open(io.BytesIO(img_data))) or ""))
+            except Exception:
+                pass
+        doc.close()
+        if text_parts:
+            return "\n".join(text_parts).strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def _read_email_attachment(uid, index, folder="INBOX", account=None):
+    """Extract and read text content from a specific email attachment."""
+    conn = None
+    try:
+        conn = _imap_connect(account)
+        conn.select(_q(folder), readonly=True)
+        status, msg_data = conn.uid("FETCH", _b(uid), "(BODY.PEEK[])")
+    finally:
+        if conn:
+            try: conn.logout()
+            except Exception: pass
+    if status != "OK":
+        return {"error": f"Failed to fetch email UID {uid}"}
+    if not msg_data or not msg_data[0] or not isinstance(msg_data[0], tuple) or len(msg_data[0]) < 2:
+        return {"error": f"Email not found with UID {uid}"}
+
+    raw = msg_data[0][1]
+    msg = email.message_from_bytes(raw)
+
+    if not msg.is_multipart():
+        return {"error": "Email is not multipart (no attachments)"}
+
+    idx = 0
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        cd = str(part.get("Content-Disposition", ""))
+        ct = part.get_content_type()
+        if ct in ("text/plain", "text/html") and "attachment" not in cd:
+            continue
+        if idx == index:
+            filename = part.get_filename()
+            if filename:
+                filename = _decode_header(filename)
+            else:
+                filename = f"attachment_{idx}"
+
+            payload = part.get_payload(decode=True)
+            if not payload:
+                return {"error": "Attachment has no content"}
+
+            content_type = ct.lower()
+            ext = os.path.splitext(filename.lower())[1]
+
+            if content_type == "text/plain" or ext in (".txt", ".md", ".json", ".csv", ".xml"):
+                try:
+                    text_content = payload.decode("utf-8", errors="replace")
+                    return {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "content": text_content,
+                    }
+                except Exception as e:
+                    return {"error": f"Failed to decode text: {e}"}
+
+            elif content_type == "text/html" or ext in (".html", ".htm"):
+                try:
+                    html_text = payload.decode("utf-8", errors="replace")
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html_text, "html.parser")
+                    text_content = soup.get_text(separator="\n").strip()
+                    return {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "content": text_content,
+                    }
+                except Exception as e:
+                    return {"error": f"Failed to parse HTML: {e}"}
+
+            elif content_type == "application/pdf" or ext == ".pdf":
+                try:
+                    import io
+                    from pypdf import PdfReader
+                    pdf_file = io.BytesIO(payload)
+                    reader = PdfReader(pdf_file)
+                    pages_text = []
+                    has_real_text = False
+                    for i, page in enumerate(reader.pages):
+                        page_text = (page.extract_text() or "").strip()
+                        if page_text:
+                            has_real_text = True
+                        pages_text.append(f"--- Page {i+1} ---\n" + page_text)
+                    text_content = "\n".join(pages_text).strip()
+                    if has_real_text:
+                        return {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "content": text_content,
+                        }
+                    text_content = _try_pdf_ocr(pdf_file)
+                    if text_content:
+                        return {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "content": text_content,
+                        }
+                    return {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "error": "PDF text extraction returned empty content for all pages. This is very likely a scanned/image-based PDF. If OCR is unavailable, use `download_attachment` to save the file and inform the user that the PDF appears to be image-only.",
+                    }
+                except Exception as e:
+                    return {"error": f"Failed to parse PDF: {e}"}
+
+            else:
+                return {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "error": f"Unsupported attachment format: {content_type}. Only text, HTML, and PDF formats can be read.",
+                }
+        idx += 1
+
+    return {"error": f"Attachment index {index} not found"}
+
+
 # ── MCP Tool Registration ──
 
 
@@ -1872,6 +2030,25 @@ async def list_tools() -> list[Tool]:
                 "Returns the local file path which you can then read with read_file. "
                 "Use this when you need to review a document, spreadsheet, or other "
                 "file attached to an email."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "string", "description": "Email UID from list_emails"},
+                    "index": {"type": "integer", "description": "Attachment index (from read_email's attachments list)"},
+                    "folder": {"type": "string", "description": "IMAP folder (default: INBOX)", "default": "INBOX"},
+                    **ACCOUNT_PROP,
+                },
+                "required": ["uid", "index"],
+            },
+        ),
+        Tool(
+            name="read_email_attachment",
+            description=(
+                "Read and extract text content from a specific email attachment. "
+                "Supports plain text files (e.g. .txt, .csv, .json, .md), HTML files (.html), "
+                "and PDF files (.pdf). Returns the text content of the attachment directly. "
+                "Use this when you want to read, analyze, or summarize the text contents of an email attachment."
             ),
             inputSchema={
                 "type": "object",
@@ -2259,6 +2436,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             return [TextContent(type="text", text=text)]
 
+        elif name == "read_email_attachment":
+            uid = arguments.get("uid")
+            index = arguments.get("index")
+            folder = arguments.get("folder", "INBOX")
+            if uid is None or index is None:
+                return [TextContent(type="text", text="Error: uid and index are required")]
+            result = _read_email_attachment(uid, index, folder, account=acct)
+            if "error" in result:
+                return [TextContent(type="text", text=f"Error: {result['error']}")]
+            text = (
+                f"Filename: {result['filename']}\n"
+                f"Content-Type: {result['content_type']}\n\n"
+                f"--- Content ---\n"
+                f"{result['content']}"
+            )
+            return [TextContent(type="text", text=text)]
+
         elif name == "search_emails":
             q = arguments.get("query", "")
             folders = arguments.get("folders") or None
@@ -2315,7 +2509,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 for a in result['attachments']:
                     size_kb = a['size'] // 1024
                     text += f"  - [{a['index']}] {a['filename']} ({a['content_type']}, {size_kb}KB)\n"
-                text += "\n_Use `download_attachment` with the UID and index to download._\n"
+                text += "\n_Use `read_email_attachment` with the UID and index to extract attachment text inline, or `download_attachment` to save it to disk._\n"
             text += f"\n---\n\n{result['body']}"
             return [TextContent(type="text", text=text)]
 
