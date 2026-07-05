@@ -723,10 +723,16 @@ def test_local_windows_download_pid_tracks_inner_bash_and_stop_kills_tree():
     routes_src = (Path(__file__).resolve().parents[1] / "routes" / "cookbook_routes.py").read_text(encoding="utf-8")
     running_src = (Path(__file__).resolve().parents[1] / "static" / "js" / "cookbookRunning.js").read_text(encoding="utf-8")
 
-    assert 'printf \'%s\\\\n\' \\"$$\\" > {pp}' in routes_src
+    assert "/api/cookbook/stop-session" in routes_src
+    assert "_scan_windows_session_pids" in routes_src
+    assert "kill_process_tree" in routes_src
+    assert "grep -Fxq" in routes_src
+    assert "_cmdline_references_hf_repo" in routes_src
+    assert "_validate_serve_model_id(repo_id_raw)" not in routes_src
+    assert "tmux has-session" in routes_src
     assert "function Stop-Tree([int]$Id)" in running_src
-    assert "('ParentProcessId = ' + $Id)" in running_src
-    assert "Stop-Tree ([int]$p)" in running_src
+    assert "_stopCookbookSession" in running_src
+    assert "_winSessionStopTreePs" in running_src
 
 
 def test_llama_cpp_rebuild_cmd_runs_clean_on_a_fresh_home(tmp_path):
@@ -887,6 +893,22 @@ def test_pip_install_no_cache_is_idempotent_and_scoped():
     assert _pip_install_no_cache("") == ""
 
 
+def test_hf_download_cache_env_default_hub_leaf():
+    from routes.cookbook_helpers import _hf_download_cache_env, _hf_download_dir_pair
+
+    hf_home, hub = _hf_download_dir_pair("~/.cache/huggingface/hub")
+    assert hf_home == "~/.cache/huggingface"
+    assert hub == "~/.cache/huggingface/hub"
+
+    sh_home, sh_hub = _hf_download_cache_env("~/.cache/huggingface/hub")
+    assert sh_home == '"$HOME/.cache/huggingface"'
+    assert sh_hub == '"$HOME/.cache/huggingface/hub"'
+
+    custom_home, custom_hub = _hf_download_cache_env("~/models")
+    assert custom_home == '"$HOME/models"'
+    assert custom_hub == '"$HOME/models/hub"'
+
+
 def test_cached_model_scan_runs_additional_hf_cache(tmp_path):
     extra_cache = tmp_path / "extra_hf_cache"
     model_dir = extra_cache / "models--acme--sample-7b"
@@ -956,3 +978,159 @@ def test_validate_serve_cmd_rejects_unrelated_subshell_pipelines():
     ]:
         with pytest.raises(HTTPException):
             _validate_serve_cmd(cmd)
+
+
+def test_cmdline_references_hf_repo_exact_match_not_prefix():
+    from routes.cookbook_routes import _cmdline_references_hf_repo
+
+    short = "org/model"
+    long_repo = "org/model-large"
+    assert _cmdline_references_hf_repo(f"python hf_download.py {short}", short)
+    assert _cmdline_references_hf_repo(f"hf download {short} --local-dir /tmp", short)
+    assert _cmdline_references_hf_repo(
+        r"C:\Users\app\.venv\Scripts\hf.exe download org/model --local-dir C:\cache", short
+    )
+    assert _cmdline_references_hf_repo(
+        r"python -u 'C:\app\scripts\hf_download.py' org/model", short
+    )
+    assert not _cmdline_references_hf_repo(f"python hf_download.py {long_repo}", short)
+    assert not _cmdline_references_hf_repo(f"hf download {long_repo}", short)
+    assert not _cmdline_references_hf_repo(
+        r"C:\path\hf.exe download org/model-large", short
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_session_dependency_pip_label_still_kills(monkeypatch):
+    """Dependency rows forward pip labels in repo_id; stop must not 400 before kill."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    import routes.cookbook_routes as cookbook_routes
+
+    router = cookbook_routes.setup_cookbook_routes()
+    endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.path == "/api/cookbook/stop-session" and "POST" in route.methods
+    )
+
+    kill_ran: list[bool] = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_subprocess_shell(*args, **kwargs):
+        kill_ran.append(True)
+        return FakeProc()
+
+    monkeypatch.setattr(cookbook_routes, "IS_WINDOWS", False)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_subprocess_shell)
+    monkeypatch.setattr(cookbook_routes, "require_admin", lambda request: None)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/cookbook/stop-session",
+            "headers": [],
+        }
+    )
+    req = SimpleNamespace(
+        session_id="cookbook-deadbeef",
+        remote_host=None,
+        ssh_port=None,
+        platform=None,
+        repo_id="llama-cpp-python[server]",
+    )
+
+    result = await endpoint(request, req)
+
+    assert result["ok"] is True
+    assert kill_ran
+
+
+@pytest.mark.asyncio
+async def test_remote_windows_stop_session_uses_subprocess_exec(monkeypatch):
+    """Remote Windows stop must not shell-expand PowerShell vars before SSH."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    import routes.cookbook_routes as cookbook_routes
+
+    router = cookbook_routes.setup_cookbook_routes()
+    impl = None
+    for route in router.routes:
+        if route.path == "/api/cookbook/stop-session" and "POST" in route.methods:
+            # Reach the inner impl via source inspection — call endpoint with mocked exec.
+            break
+
+    captured: list[list[str]] = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_subprocess_exec(*args, **kwargs):
+        captured.append(list(args))
+        return FakeProc()
+
+    monkeypatch.setattr(cookbook_routes, "IS_WINDOWS", False)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(cookbook_routes, "require_admin", lambda request: None)
+
+    endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.path == "/api/cookbook/stop-session" and "POST" in route.methods
+    )
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/cookbook/stop-session",
+            "headers": [],
+        }
+    )
+    req = SimpleNamespace(
+        session_id="cookbook-deadbeef",
+        remote_host="winbox",
+        ssh_port="2222",
+        platform="windows",
+        repo_id=None,
+    )
+
+    result = await endpoint(request, req)
+
+    assert result["ok"] is True
+    assert captured
+    argv = captured[0]
+    assert argv[:3] == ["ssh", "-o", "ConnectTimeout=5"]
+    assert "-p" in argv and "2222" in argv
+    assert "winbox" in argv
+    ps_idx = argv.index("powershell")
+    assert argv[ps_idx + 1] == "-NoProfile"
+    assert argv[ps_idx + 2] == "-Command"
+    ps = argv[ps_idx + 3]
+    assert "Join-Path $env:TEMP" in ps
+    assert "$p" in ps
+    assert "taskkill /F /T /PID $p" in ps
+
+
+def test_coerce_ssh_port_rejects_out_of_range():
+    from routes.cookbook_routes import _coerce_ssh_port
+
+    assert _coerce_ssh_port("2222") == "2222"
+    assert _coerce_ssh_port("0") is None
+    assert _coerce_ssh_port("65536") is None
+    assert _coerce_ssh_port("99999") is None

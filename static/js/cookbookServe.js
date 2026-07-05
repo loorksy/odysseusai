@@ -60,6 +60,10 @@ function _readCachedModelScan(sig) {
 
 function _writeCachedModelScan(sig, data) {
   try {
+    // Don't cache empty scans for hours — a pre-download scan would hide models
+    // that finish downloading later until the TTL expires.
+    const models = data?.models;
+    if (!Array.isArray(models) || models.length === 0) return;
     const all = JSON.parse(localStorage.getItem(_CACHED_MODELS_SCAN_KEY) || '{}');
     all[sig] = { ts: Date.now(), data };
     const keys = Object.keys(all);
@@ -69,6 +73,78 @@ function _writeCachedModelScan(sig, data) {
     }
     localStorage.setItem(_CACHED_MODELS_SCAN_KEY, JSON.stringify(all));
   } catch {}
+}
+
+function _invalidateCachedModelScan(sig) {
+  try {
+    const all = JSON.parse(localStorage.getItem(_CACHED_MODELS_SCAN_KEY) || '{}');
+    if (sig) delete all[sig];
+    else Object.keys(all).forEach((k) => { delete all[k]; });
+    localStorage.setItem(_CACHED_MODELS_SCAN_KEY, JSON.stringify(all));
+  } catch {}
+}
+
+function _cachedModelScanSig() {
+  let host = _envState.remoteHost || '';
+  const modelDirs = [];
+  const cacheSrv = document.getElementById('hwfit-cache-server');
+  const _serverByCacheValue = (val) => {
+    if (val === 'local') return null;
+    return _serverByVal?.(val)
+      || (/^\d+$/.test(String(val)) ? _envState.servers[parseInt(val)] : null)
+      || _envState.servers.find(x => x.name === val)
+      || null;
+  };
+  let selectedServer = null;
+  if (cacheSrv) {
+    const val = cacheSrv.value;
+    if (val === 'local') {
+      host = '';
+      selectedServer = _envState.servers.find(s => !s.host || s.host === 'local') || _envState.servers[0];
+    } else {
+      const s = _serverByCacheValue(val);
+      if (s) { host = s.host; selectedServer = s; }
+    }
+  } else {
+    selectedServer = _envState.servers.find(s => s.host === host) || _envState.servers[0];
+  }
+  if (selectedServer && Array.isArray(selectedServer.modelDirs)) {
+    for (const d of selectedServer.modelDirs) {
+      if (d && d !== '~/.cache/huggingface/hub') modelDirs.push(d);
+    }
+  }
+  const qp = new URLSearchParams();
+  if (host) {
+    qp.set('host', host);
+    const _sp = _getPort(host);
+    if (_sp) qp.set('ssh_port', _sp);
+    const _plat = _getPlatform(host);
+    if (_plat) qp.set('platform', _plat);
+  }
+  if (modelDirs.length) qp.set('model_dir', modelDirs.join(','));
+  const params = qp.toString() ? `?${qp}` : '';
+  return params || 'local';
+}
+
+function _modelMatchesServeFilter(m, activeTag, searchVal) {
+  if (searchVal && !(m.repo_id || '').toLowerCase().includes(searchVal)) return false;
+  if (!activeTag) return true;
+  if (activeTag.startsWith('fam:')) return m._family === activeTag.slice(4);
+  return m._tag === activeTag;
+}
+
+function _renderEmptyCachedModelsList(list, host) {
+  const tagContainer = document.getElementById('serve-tags');
+  if (tagContainer) tagContainer.innerHTML = '';
+  if (!list) return;
+  if (!host) {
+    list.innerHTML = '<div class="hwfit-loading" style="flex-direction:column;gap:8px;text-align:center;"><div>No cached models found</div><div style="font-size:11px;opacity:0.55;max-width:420px;line-height:1.4;">Docker Local uses Odysseus’s cache in <code>data/huggingface</code>. Download a model here, or copy an existing host HuggingFace cache into that folder once.</div><button type="button" class="hwfit-gpu-btn serve-empty-scan-btn" style="height:26px;padding:3px 10px;">Refresh</button></div>';
+  } else {
+    list.innerHTML = '<div class="hwfit-loading" style="flex-direction:column;gap:8px;text-align:center;"><div>No cached models found</div><div style="font-size:11px;opacity:0.55;max-width:420px;line-height:1.4;">No complete model folders were found on this server.</div><button type="button" class="hwfit-gpu-btn serve-empty-scan-btn" style="height:26px;padding:3px 10px;">Refresh</button></div>';
+  }
+  list.querySelector('.serve-empty-scan-btn')?.addEventListener('click', () => {
+    _fetchCachedModels(true);
+  });
 }
 
 function _loadServeFavorites() {
@@ -642,16 +718,13 @@ function _filterCachedList() {
   if (!list) return;
   const activeTag = tagContainer?.querySelector('.memory-cat-chip.active')?.dataset.serveTag || '';
   const searchVal = (document.getElementById('serve-search')?.value || '').toLowerCase().trim();
-  const isFamily = activeTag.startsWith('fam:');
-  const familyVal = isFamily ? activeTag.slice(4) : '';
 
   list.querySelectorAll('.memory-item[data-repo]').forEach(item => {
     const repo = (item.dataset.repo || '').toLowerCase();
     const tag = item.dataset.tag || '';
     const family = item.dataset.family || '';
-    const tagMatch = !activeTag || (isFamily ? family === familyVal : tag === activeTag);
-    const searchMatch = !searchVal || repo.includes(searchVal);
-    item.style.display = (tagMatch && searchMatch) ? '' : 'none';
+    const tagMatch = _modelMatchesServeFilter({ _tag: tag, _family: family, repo_id: item.dataset.repo || '' }, activeTag, searchVal);
+    item.style.display = tagMatch ? '' : 'none';
   });
 }
 
@@ -872,7 +945,11 @@ function _ggufSearchDirExpr(model, repo) {
 function _rerenderCachedModels() {
   const list = document.getElementById('hwfit-cached-list');
   const tagContainer = document.getElementById('serve-tags');
-  if (!list || !_cachedAllModels.length) return;
+  if (!list) return;
+  if (!_cachedAllModels.length) {
+    _renderEmptyCachedModelsList(list, _resolveCacheHost());
+    return;
+  }
 
   const allModels = _cachedAllModels;
   const _h = (text) => `<span class="hwfit-hint" title="${text}">?</span>`;
@@ -896,8 +973,7 @@ function _rerenderCachedModels() {
   let html = '';
   let visibleCount = 0;
   for (const m of allModels) {
-    if (activeTag && m._tag !== activeTag) continue;
-    if (searchVal && !(m.repo_id || '').toLowerCase().includes(searchVal)) continue;
+    if (!_modelMatchesServeFilter(m, activeTag, searchVal)) continue;
     visibleCount++;
     const shortName = m.repo_id.split('/').pop() || m.repo_id;
     const hfLink = m.repo_id.includes('/') ? `https://huggingface.co/${m.repo_id}` : '';
@@ -3426,16 +3502,56 @@ function _resolveCacheHost() {
   return host;
 }
 
+function _localWinPowerShellCmd(ps) {
+  // shell_routes runs bare Remove-Item through Git Bash on Windows, where the
+  // cmdlet does not exist. Prefix powershell so _create_shell uses cmd.exe.
+  return `powershell -Command "${String(ps).replace(/"/g, '\\"')}"`;
+}
+
+function _deleteShellAlreadyGone(data) {
+  const text = `${data?.stderr || ''}\n${data?.stdout || ''}`.toLowerCase();
+  return /cannot find path|does not exist|no such file|itemnotfoundexception|model.*not found|no such model/.test(text);
+}
+
+function _isOllamaCachedModel(m) {
+  return !!(m && (m.is_ollama || m.backend === 'ollama' || m.path === 'ollama'));
+}
+
+function _ollamaDeleteCmd(modelName, host = '') {
+  const name = String(modelName || '').trim();
+  if (!name) return '';
+  const _psSingleQuote = (value) => `'${String(value || '').replace(/'/g, "''")}'`;
+  if (_isWindows()) {
+    const ps = [
+      'if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) { Write-Error \'Ollama not found\'; exit 127 }',
+      `$null | ollama rm ${_psSingleQuote(name)}`,
+      'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
+    ].join('; ');
+    if (host) {
+      const pf = _sshPrefix(_getPort(host));
+      return `ssh ${pf}${host} "powershell -Command \\"${ps.replace(/"/g, '\\"')}\\""`;
+    }
+    return _localWinPowerShellCmd(ps);
+  }
+  let cmd = `ollama rm ${_shellQuote(name)}`;
+  if (host) cmd = _sshCmd(host, cmd, _getPort(host));
+  return cmd;
+}
+
 async function _deleteCachedModel(repo, itemEl, skipConfirm = false, model = null) {
   const m = model || _cachedAllModels.find(x => x.repo_id === repo);
+  const isOllama = _isOllamaCachedModel(m);
   // Delete the EXACT on-disk path the scan reported. Models in a custom
   // model dir live at <path>/<repo>; HF-cache models at
   // <path>/models--<org>--<name>. The old code always rm'd the hardcoded
   // ~/.cache/huggingface/hub path, so models in a custom dir were never
   // removed and reappeared on the next scan. m.path is already absolute
   // (os.path.expanduser ran on the host); only the bare fallback uses ~.
+  // Ollama models use path='ollama' — remove via `ollama rm`, not filesystem.
   let target;
-  if (m && m.is_local_dir && m.path) {
+  if (isOllama) {
+    target = '';
+  } else if (m && m.is_local_dir && m.path) {
     target = `${m.path}/${repo}`;
   } else if (m && m.path) {
     target = `${m.path}/models--${repo.replace(/\//g, '--')}`;
@@ -3445,33 +3561,44 @@ async function _deleteCachedModel(repo, itemEl, skipConfirm = false, model = nul
   let deleteChoice = { mode: 'repo' };
   const ggufFiles = _ggufFilesForModel(m);
   if (!skipConfirm) {
-    if (ggufFiles.length > 1) {
+    if (!isOllama && ggufFiles.length > 1) {
       deleteChoice = await _ggufDeleteChoice(repo, ggufFiles);
       if (!deleteChoice) return;
-    } else if (!(await uiModule.styledConfirm(`Delete ${repo} from cache?`, { confirmText: 'Delete', danger: true }))) {
+    } else if (!(await uiModule.styledConfirm(
+      isOllama ? `Delete ${repo} from Ollama?` : `Delete ${repo} from cache?`,
+      { confirmText: 'Delete', danger: true },
+    ))) {
       return;
     }
   }
   const host = _resolveCacheHost();
   let cmd;
-  if (_isWindows()) {
+  if (isOllama) {
+    cmd = _ollamaDeleteCmd(repo, host);
+    if (!cmd) return;
+  } else if (_isWindows()) {
     const _psSingleQuote = (value) => `'${String(value || '').replace(/'/g, "''")}'`;
     const winTarget = target.startsWith('~')
       ? target.replace(/^~/, '$env:USERPROFILE').replace(/\//g, '\\')
       : target.replace(/\//g, '\\');
+    let ps;
     if (deleteChoice.mode === 'files') {
       const targets = deleteChoice.files
         .map(f => _safeGgufRelPath(f.rel_path))
         .filter(Boolean)
         .map(rel => `${winTarget}\\${rel.replace(/\//g, '\\')}`);
       if (!targets.length) return;
-      cmd = targets.map(p => `Remove-Item -Force ${_psSingleQuote(p)} -ErrorAction SilentlyContinue`).join('; ');
+      ps = targets.map(p => (
+        `if (Test-Path ${_psSingleQuote(p)}) { Remove-Item -Force ${_psSingleQuote(p)} -ErrorAction Stop }`
+      )).join('; ');
     } else {
-      cmd = `Remove-Item -Recurse -Force ${_psSingleQuote(winTarget)} -ErrorAction SilentlyContinue`;
+      ps = `if (Test-Path ${_psSingleQuote(winTarget)}) { Remove-Item -Recurse -Force ${_psSingleQuote(winTarget)} -ErrorAction Stop }`;
     }
     if (host) {
       const pf = _sshPrefix(_getPort(host));
-      cmd = `ssh ${pf}${host} "powershell -Command \\"${cmd}\\""`;
+      cmd = `ssh ${pf}${host} "powershell -Command \\"${ps}\\""`;
+    } else {
+      cmd = _localWinPowerShellCmd(ps);
     }
   } else {
     // $HOME expands inside double quotes; ~ would not, so normalize the
@@ -3510,13 +3637,21 @@ async function _deleteCachedModel(repo, itemEl, skipConfirm = false, model = nul
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command: cmd }),
     });
-    if (!res.ok) { uiModule.showError(`Delete failed (${res.status})`); return; }
+    const data = await res.json().catch(() => ({}));
+    const deleteOk = res.ok && (data.exit_code === 0 || _deleteShellAlreadyGone(data));
+    if (!deleteOk) {
+      const detail = String(data.stderr || data.stdout || '').trim().slice(0, 240);
+      uiModule.showError(detail ? `Delete failed: ${detail}` : `Delete failed (${res.status || data.exit_code})`);
+      return;
+    }
+    _invalidateCachedModelScan(_cachedModelScanSig());
+    _cachedAllModels = _cachedAllModels.filter(x => x.repo_id !== repo);
     if (deleteChoice.mode === 'files') {
       if (m && Array.isArray(m.gguf_files)) {
         const removed = new Set(deleteChoice.files.map(f => _safeGgufRelPath(f.rel_path)));
         m.gguf_files = m.gguf_files.filter(f => !removed.has(_safeGgufRelPath(f.rel_path)));
       }
-      await _fetchCachedModels(false);
+      await _fetchCachedModels(true);
     } else if (itemEl) {
       itemEl.querySelector('.cookbook-delete-overlay')?.remove();
       itemEl.style.transition = 'opacity 0.24s ease, transform 0.24s ease, max-height 0.28s ease, padding 0.28s ease, margin 0.28s ease';
@@ -3531,8 +3666,17 @@ async function _deleteCachedModel(repo, itemEl, skipConfirm = false, model = nul
       requestAnimationFrame(() => { itemEl.style.maxHeight = '0'; });
       await new Promise(resolve => setTimeout(resolve, 300));
       if (itemEl.parentElement) itemEl.remove();
-      // Drop from the in-memory list so a re-render/filter doesn't resurrect it.
-      _cachedAllModels = _cachedAllModels.filter(x => x.repo_id !== repo);
+      if (!_cachedAllModels.length) {
+        _renderEmptyCachedModelsList(document.getElementById('hwfit-cached-list'), _resolveCacheHost());
+      }
+      void _fetchCachedModels(true);
+    } else {
+      if (!_cachedAllModels.length) {
+        _renderEmptyCachedModelsList(document.getElementById('hwfit-cached-list'), _resolveCacheHost());
+      } else {
+        _rerenderCachedModels();
+      }
+      void _fetchCachedModels(true);
     }
   } catch (e) {
     uiModule.showError('Delete failed: ' + (e && e.message ? e.message : e));
@@ -3654,16 +3798,7 @@ function _renderCachedModelsData(list, data, host) {
   _cachedAllModels = allModels;
 
   if (!allModels.length) {
-    if (!host) {
-      list.innerHTML = '<div class="hwfit-loading" style="flex-direction:column;gap:6px;text-align:center;"><div>No cached models found</div><div style="font-size:11px;opacity:0.55;max-width:420px;line-height:1.4;">Docker Local uses Odysseus’s cache in <code>data/huggingface</code>. Download a model here, or copy an existing host HuggingFace cache into that folder once.</div></div>';
-    } else {
-      list.innerHTML = '<div class="hwfit-loading" style="flex-direction:column;gap:8px;text-align:center;"><div>No cached models found</div><div style="font-size:11px;opacity:0.55;max-width:420px;line-height:1.4;">No complete model folders were found on this server.</div><button type="button" class="hwfit-gpu-btn serve-empty-scan-btn" style="height:26px;padding:3px 10px;">Refresh</button></div>';
-      list.querySelector('.serve-empty-scan-btn')?.addEventListener('click', () => {
-        _fetchCachedModels(true);
-      });
-    }
-    const tagContainer = document.getElementById('serve-tags');
-    if (tagContainer) tagContainer.innerHTML = '';
+    _renderEmptyCachedModelsList(list, host);
     return;
   }
 
@@ -3721,6 +3856,14 @@ function _renderCachedModelsData(list, data, host) {
   }
 
   _rerenderCachedModels();
+}
+
+export async function refreshCachedModelsAfterDownload() {
+  _invalidateCachedModelScan();
+  const serveTab = document.querySelector('#cookbook-modal .cookbook-tab[data-backend="Serve"]');
+  if (serveTab?.classList.contains('active')) {
+    try { await _fetchCachedModels(true); } catch {}
+  }
 }
 
 export async function _fetchCachedModels(fresh = false, opts = {}) {
