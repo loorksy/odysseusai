@@ -1,4 +1,4 @@
-"""Regression guard for issue #1291 - CPU-only serve still emitted GPU-only flags.
+"""Regression guard for issue #1291 — CPU-only serve still emitted GPU-only flags.
 
 The llama.cpp serve command builder (static/js/cookbook.js) added
 `--flash-attn on` and exported `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` from
@@ -16,8 +16,8 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "static/js/cookbook.js"
 SERVE_SRC = Path(__file__).resolve().parent.parent / "static/js/cookbookServe.js"
-ROOT = SRC.parent.parent.parent
-ROUTES_SRC = ROOT / "routes/cookbook_routes.py"
+ROUTES_SRC = Path(__file__).resolve().parent.parent / "routes/cookbook_routes.py"
+
 
 def test_cpu_only_drops_gpu_only_flags():
     text = SRC.read_text(encoding="utf-8")

@@ -12,6 +12,7 @@ and `email_pollers.py` (the background loops):
     - Pydantic models, shared constants, scheduled-DB bootstrap
 """
 
+from __future__ import annotations
 import os
 import base64
 import time
@@ -1841,6 +1842,16 @@ _EMAIL_REPLY_SYS_PROMPT_BASE = (
     "(ideally wrapped in <think>...</think>). Only the text between <<<REPLY>>> and <<<END>>> "
     "is sent as the email — nothing else is shown to anyone."
 )
+
+
+def _get_email_reply_sys_prompt():
+    """Return the email reply system prompt with the user's language directive injected."""
+    try:
+        from src.user_time import language_directive
+        suffix = language_directive()
+    except Exception:
+        suffix = ""
+    return _EMAIL_REPLY_SYS_PROMPT_BASE + suffix
 
 
 # ── Request models ──

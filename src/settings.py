@@ -4,6 +4,7 @@
 Single source of truth for reading/writing data/settings.json and data/features.json.
 All modules should import from here instead of accessing files directly.
 """
+from __future__ import annotations
 
 import json
 import time
@@ -156,7 +157,6 @@ DEFAULT_SETTINGS = {
     "utility_model_fallbacks": [],
     "teacher_model": "",
     "teacher_enabled": False,
-    "teacher_tier2_enabled": False,
     # Skills: minimum self-reported confidence for an auto-written (LLM-authored)
     # DRAFT skill to be injected into the agent prompt. Published skills always
     # qualify. Keeps low-confidence auto-skills out of context until they're

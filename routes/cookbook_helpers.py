@@ -1,6 +1,7 @@
 """cookbook_helpers.py — validators + small helpers shared by the cookbook routes.
 Extracted from cookbook_routes.py; the routes module imports the symbols it needs."""
 
+from __future__ import annotations
 import json
 import logging
 import ntpath
@@ -573,7 +574,7 @@ OLLAMA_MISSING_HINT = (
 # Allow-list of binaries permitted as the leading token of `req.cmd` for /api/model/serve.
 # Anything else is rejected before the cmd is interpolated into a tmux/PowerShell wrapper.
 _SERVE_CMD_ALLOWLIST = {
-    "vllm", "llama-server", "llama-server.exe", "llama_server", "llama.cpp", "ollama",
+    "vllm", "llama-server", "llama_server", "llama.cpp", "ollama",
     "python", "python3",
     "sglang", "lmdeploy",
     "node", "npx",

@@ -479,9 +479,9 @@ function _hwfitShowError(list, host, detail) {
   div.className = 'hwfit-loading';
   div.style.cssText = 'flex-direction:column;gap:8px;text-align:center;';
   div.innerHTML =
-    `<div style="color:var(--red);font-weight:600;">Couldn't scan ${where}</div>`
+    `<div style="color:var(--red);font-weight:600;">${(window.__t || (k=>k))('cookbook.failedToLoad')} ${where}</div>`
     + (detail ? `<div style="opacity:0.6;font-size:11px;max-width:340px;line-height:1.4;">${esc(detail)}</div>` : '')
-    + `<button type="button" class="hwfit-gpu-btn" id="hwfit-retry" style="margin-top:2px;height:26px;">↻ Retry</button>`;
+    + `<button type="button" class="hwfit-gpu-btn" id="hwfit-retry" style="margin-top:2px;height:26px;">↻ ${(window.__t || (k=>k))('common.retry')}</button>`;
   list.innerHTML = '';
   list.appendChild(div);
   const rb = div.querySelector('#hwfit-retry');
@@ -625,10 +625,10 @@ export async function _hwfitFetch(fresh = false, opts = {}) {
       loadingDiv.style.cssText = 'flex-direction:column;gap:6px;text-align:center;';
       loadingDiv.appendChild(wp.element);
       const loadingTitle = document.createElement('div');
-      loadingTitle.textContent = 'No cached scan yet';
+      loadingTitle.textContent = (window.__t || (k=>k))('cookbook.noCachedScan');
       loadingTitle.style.cssText = 'font-size:12px;opacity:0.7;';
       const loadingLbl = document.createElement('div');
-      loadingLbl.textContent = 'Scanning hardware…';
+      loadingLbl.textContent = (window.__t || (k=>k))('cookbook.scanning');
       loadingLbl.style.cssText = 'font-size:11px;opacity:0.55;max-width:420px;line-height:1.4;';
       loadingDiv.appendChild(loadingTitle);
       loadingDiv.appendChild(loadingLbl);
@@ -656,10 +656,10 @@ export async function _hwfitFetch(fresh = false, opts = {}) {
       // Text label like the other cookbook tabs: "Loading…", then if the scan runs
       // long (remote SSH hardware probe), switch to "Scanning hardware…".
       const loadingLbl = document.createElement('div');
-      loadingLbl.textContent = 'Loading…';
+      loadingLbl.textContent = (window.__t || (k=>k))('cookbook.loadingPackages');
       loadingLbl.style.cssText = 'text-align:center;opacity:0.5;font-size:11px;';
       loadingDiv.appendChild(loadingLbl);
-      setTimeout(() => { if (loadingLbl.isConnected) loadingLbl.textContent = 'Scanning hardware…'; }, 2000);
+      setTimeout(() => { if (loadingLbl.isConnected) loadingLbl.textContent = (window.__t || (k=>k))('cookbook.scanning'); }, 2000);
       list.innerHTML = '';
       list.appendChild(loadingDiv);
       _hwfitCache = null;   // no instant paint — clear until the fetch returns
@@ -1220,9 +1220,9 @@ export function _hwfitRenderList(el, models) {
       || document.getElementById('hwfit-quant')?.value
       || document.getElementById('hwfit-engine')?.value);
     let msg;
-    if (hasFilters) msg = 'No models match these filters — try clearing the search, use-case, quant, or engine.';
-    else if (hasHw) msg = 'No models fit — the hardware probe may have under-reported. Try Rescan.';
-    else msg = 'No models fit your hardware';
+    if (hasFilters) msg = (window.__t || (k=>k))('cookbook.noModels');
+    else if (hasHw) msg = (window.__t || (k=>k))('cookbook.failedToLoad');
+    else msg = (window.__t || (k=>k))('cookbook.noModels');
     el.innerHTML = `<div class="hwfit-loading">${msg}</div>`;
     return;
   }
@@ -1598,11 +1598,11 @@ export function _expandModelRow(row, modelData) {
           const _names = _clashing.map(t => t.payload?.repo_id || t.repo || t.name || '?').filter(Boolean);
           const _ok = await window.styledConfirm?.(
             `${_clashing.length} model${_clashing.length === 1 ? '' : 's'} on port ${_qrPort} (${_names.join(', ')}). Stop it and launch this one?`,
-            { confirmText: 'Stop & launch', cancelText: 'Cancel' }
+            { confirmText: 'Stop & launch', cancelText: (window.__t || (k=>k))('common.cancel') }
           );
           if (!_ok) return;
           quickRunBtn.disabled = true;
-          quickRunBtn.textContent = 'Stopping…';
+          quickRunBtn.textContent = (window.__t || (k=>k))('common.loading');
           for (const t of _clashing) {
             try {
               const _taskEl = document.querySelector(`.cookbook-task[data-task-id="${t.sessionId}"]`);
@@ -1703,7 +1703,7 @@ export function _expandModelRow(row, modelData) {
       }
 
       quickRunBtn.disabled = true;
-      quickRunBtn.textContent = 'Starting...';
+      quickRunBtn.textContent = (window.__t || (k=>k))('common.loading');
 
       // Smart defaults based on hardware and model
       const system = _hwfitCache?.system || {};
@@ -1792,7 +1792,7 @@ export function _expandModelRow(row, modelData) {
       );
       if (!_ok) {
         quickRunBtn.disabled = false;
-        quickRunBtn.textContent = 'Run';
+        quickRunBtn.textContent = (window.__t || (k=>k))('tasks.run');
         return;
       }
 
@@ -1829,7 +1829,7 @@ export function _expandModelRow(row, modelData) {
         uiModule.showError('Launch failed: ' + e.message);
       }
       quickRunBtn.disabled = false;
-      quickRunBtn.textContent = 'Run';
+      quickRunBtn.textContent = (window.__t || (k=>k))('tasks.run');
     });
   }
 
@@ -2009,7 +2009,7 @@ export function _hwfitInit() {
       wp.element.style.top = '-2px';   // sit a touch higher, aligned with the label
       rescan.innerHTML = '';
       rescan.appendChild(wp.element);
-      rescan.appendChild(document.createTextNode('RESCAN'));
+      rescan.appendChild(document.createTextNode((window.__t || (k=>k))('common.retry')));
       // Reset toggle state (no flicker — buttons stay until the fresh scan swaps them).
       _resetGpuToggleState();
       try {
@@ -2194,7 +2194,7 @@ export function _hwfitInit() {
     }
     if (genBtn) {
       genBtn.disabled = true;
-      genBtn.textContent = generate ? 'Generating...' : 'Loading...';
+      genBtn.textContent = generate ? (window.__t || (k=>k))('common.loading') : (window.__t || (k=>k))('common.loading');
     }
     try {
       let publicKey = await _fetchCookbookSshKey(generate);
@@ -2358,7 +2358,7 @@ export function _hwfitInit() {
           }));
         } catch (_) {}
         saveBtn.classList.add('saved');
-        saveBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#50fa7b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;flex-shrink:0;"><polyline points="20 6 9 17 4 12"/></svg>Saved';
+        saveBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#50fa7b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;flex-shrink:0;"><polyline points="20 6 9 17 4 12"/></svg>' + (window.__t || (k=>k))('common.save');
       });
     }
     const rmBtn = entry.querySelector('.cookbook-server-rm');
@@ -2368,7 +2368,7 @@ export function _hwfitInit() {
                 || 'this server';
       let ok = true;
       if (uiModule && uiModule.styledConfirm) {
-        ok = await uiModule.styledConfirm(`Remove "${name}"?`, { confirmText: 'Remove', danger: true });
+        ok = await uiModule.styledConfirm(`Remove "${name}"?`, { confirmText: (window.__t || (k=>k))('common.delete'), danger: true });
       } else {
         ok = confirm(`Remove "${name}"?`);
       }
@@ -2395,7 +2395,7 @@ export function _hwfitInit() {
         if (!host) return;
         setupBtn.disabled = true;
         const origText = setupBtn.textContent;
-        setupBtn.textContent = 'Installing...';
+        setupBtn.textContent = (window.__t || (k=>k))('common.loading');
         try {
           const res = await fetch('/api/cookbook/setup', {
             method: 'POST', credentials: 'same-origin',
@@ -2445,7 +2445,7 @@ export function _hwfitInit() {
             uiModule.showError(data.error || data.output || 'Setup failed');
           }
         } catch (e) {
-          setupBtn.textContent = 'Error';
+          setupBtn.textContent = (window.__t || (k=>k))('common.error');
           setupBtn.style.color = 'var(--red)';
           uiModule.showError(e.message);
         }

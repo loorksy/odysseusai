@@ -3,13 +3,15 @@
 # which raises KeyError on Python 3.13+ (PEP 667). Build patched wheels here so
 # the final image / Cookbook never has to compile the broken sdists. See
 # docker/build-realesrgan-wheels.sh for the full rationale.
-FROM python:3.14-slim AS realesrgan-wheels
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim AS realesrgan-wheels
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 COPY docker/build-realesrgan-wheels.sh /usr/local/bin/build-realesrgan-wheels.sh
 RUN bash /usr/local/bin/build-realesrgan-wheels.sh /wheels
 
-FROM python:3.14-slim
+# Final image: Python 3.12 (spacy/thinc/blis don't compile on 3.14).
+FROM python:${PYTHON_VERSION}-slim
 
 # System deps. tmux is required by Cookbook for background downloads/serves.
 # openssh-client is required for Cookbook remote server tests, setup, probes,
@@ -75,6 +77,20 @@ ARG INSTALL_OPTIONAL=false
 COPY requirements.txt requirements-optional.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
     && if [ "$INSTALL_OPTIONAL" = "true" ]; then pip install --no-cache-dir -r requirements-optional.txt; fi
+
+# Local speech-to-text and text-to-speech.
+# STT: faster-whisper (CPU by default).
+# TTS: Kokoro-82M (English) + Piper (multilingual incl. Russian).
+# Installed by default. Set INSTALL_SPEECH_GPU=true to add CUDA torch instead of CPU.
+ARG INSTALL_SPEECH_GPU=false
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir faster-whisper kokoro soundfile piper-tts && \
+    python3 -m spacy download en_core_web_sm && \
+    mkdir -p /app/data/piper_voices && \
+    python3 -m piper.download_voices --download-dir /app/data/piper_voices ru_RU-irina-medium en_US-lessac-medium
+RUN if [ "$INSTALL_SPEECH_GPU" = "true" ]; then \
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121; \
+    fi
 
 # python-magic powers content-based MIME sniffing in src/upload_handler.py.
 # Image-only (not in requirements.txt) because it needs the libmagic1 system

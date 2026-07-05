@@ -96,7 +96,7 @@ async function _runSynthForPane(modelToUse, synthPrompt, synthBody, spinner, his
     state._abortControllers.push(synthAc);
     const streamRes = await fetch(`${state.API_BASE}/api/chat_stream`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Language': localStorage.getItem('odysseus-lang') || '' },
       body: JSON.stringify({ session: createData.id, message: synthPrompt }),
       signal: synthAc.signal,
     });
@@ -139,7 +139,7 @@ async function _runSynthForPane(modelToUse, synthPrompt, synthBody, spinner, his
     fetch(`${state.API_BASE}/api/session/${createData.id}`, { method: 'DELETE' }).catch(() => {});
   } catch (e) {
     if (spinner) spinner.stop();
-    synthBody.innerHTML = '<div style="color:var(--color-error);font-size:0.85em;">Synthesis failed: ' + escapeHtml(e.message) + '</div>';
+    synthBody.innerHTML = '<div style="color:var(--color-error);font-size:0.85em;">' + ((window.__t || (k=>k))('compare.synthesisFailed', {error: escapeHtml(e.message)})) + '</div>';
   }
 }
 
@@ -256,7 +256,7 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
     }
 
     const response = await fetch(`${state.API_BASE}/api/chat_stream`, {
-      method: 'POST', body: fd, signal: ac.signal
+      method: 'POST', body: fd, headers: { 'X-Language': localStorage.getItem('odysseus-lang') || '' }, signal: ac.signal
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
@@ -624,11 +624,11 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
         notice.appendChild(retryBtn);
         aiBody.appendChild(notice);
       } else {
-        if (!accumulated.trim()) aiBody.innerHTML = '<div style="color:#f0ad4e;font-size:0.9em;">Cancelled.</div>';
+        if (!accumulated.trim()) aiBody.innerHTML = '<div style="color:#f0ad4e;font-size:0.9em;">' + ((window.__t || (k=>k))('compare.cancelled')) + '</div>';
       }
     } else {
       console.error('Compare stream error:', error);
-      aiBody.innerHTML = '<span style="color:var(--color-error);">Error: ' + escapeHtml(error.message) + '</span>';
+      aiBody.innerHTML = '<span style="color:var(--color-error);">' + ((window.__t || (k=>k))('compare.error', {error: escapeHtml(error.message)})) + '</span>';
     }
   } finally {
     clearTimeout(timeoutId);
