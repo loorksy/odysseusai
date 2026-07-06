@@ -23,6 +23,10 @@ import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handle
 import createResearchSynapse from './researchSynapse.js';
 import { createStreamRenderer } from './streamingRenderer.js';
 import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composerArrowUpRecall.js';
+import { modelRouteLabel, sameModelName, shortModel } from './model/models.js';
+import { getImageCost, getModelCost } from './model/pricing.js';
+import { isSubscriptionEndpoint } from './model/endpoint.js';
+import { safeDisplayImageSrc, safeToolScreenshotSrc } from './util/safeString.js';
 
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
@@ -58,10 +62,6 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   let _autoContinuePending = false; // marks the next submit as an auto-continue (don't reset the counter)
   const _AUTO_NUDGE_CAP = 3;
 
-  // shortModel and modelColor are now in chatRenderer.js
-  var _shortModel = chatRenderer.shortModel;
-  var _modelRouteLabel = chatRenderer.modelRouteLabel;
-  var _sameModelName = chatRenderer.sameModelName;
   var _applyModelColor = chatRenderer.applyModelColor;
   function _setRoleModelLabel(roleEl, requestedModel, actualModel, opts) {
     if (!roleEl) return;
@@ -69,12 +69,12 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     const tsSpan = roleEl.querySelector('.role-timestamp');
     const req = requestedModel || actualModel || '';
     const actual = actualModel || requestedModel || '';
-    let label = _modelRouteLabel(req, actual);
+    let label = modelRouteLabel(req, actual);
     if (opts.suffix) label += ' (' + opts.suffix + ')';
     if (opts.characterName) label = opts.characterName;
     roleEl.textContent = label + ' ';
     _applyModelColor(roleEl, actual || req);
-    if (req && actual && !_sameModelName(req, actual)) {
+    if (req && actual && !sameModelName(req, actual)) {
       roleEl.title = req + ' -> ' + actual + (opts.reason ? ': ' + opts.reason : '');
     } else if (!opts.reason) {
       roleEl.removeAttribute('title');
@@ -219,8 +219,6 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
   // Model/image pricing, _buildImageBubble now in chatRenderer.js
   var _buildImageBubble = chatRenderer.buildImageBubble;
-  var getModelCost = chatRenderer.getModelCost;
-  var getImageCost = chatRenderer.getImageCost;
 
   // stripToolBlocks and roleTimestamp now in chatRenderer.js
   var stripToolBlocks = chatRenderer.stripToolBlocks;
@@ -1172,7 +1170,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         loadingText = 'Processing request...';
       }
 
-      var roleLabel = _modelRouteLabel(modelName, modelName);
+      var roleLabel = modelRouteLabel(modelName, modelName);
       var _charNameInit = presetsModule.getCharacterName ? presetsModule.getCharacterName() : '';
       if (_charNameInit) roleLabel = _charNameInit;
       const roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
@@ -2140,8 +2138,8 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 // it visible so a misconfigured provider is never silently
                 // masked under the selected model's name.
                 if (!_isBg) {
-                  var _selM = _shortModel(json.selected_model || '');
-                  var _ansM = _shortModel(json.answered_by || '');
+                  var _selM = shortModel(json.selected_model || '');
+                  var _ansM = shortModel(json.answered_by || '');
                   uiModule.showToast('⚠ ' + _selM + ' failed — answered by ' + _ansM, 6000);
                   if (holder) {
                     var _rEl = holder.querySelector('.role');
@@ -2153,7 +2151,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                       _applyModelColor(_rEl, json.answered_by);
                       if (_tsS) _rEl.appendChild(_tsS);
                       holder._requestedModel = json.selected_model || holder._requestedModel || modelName;
-                      const _hasResolvedActual = holder._actualModel && !_sameModelName(holder._actualModel, holder._requestedModel);
+                      const _hasResolvedActual = holder._actualModel && !sameModelName(holder._actualModel, holder._requestedModel);
                       holder._actualModel = _hasResolvedActual ? holder._actualModel : (json.answered_by || holder._actualModel || holder._requestedModel);
                       _setRoleModelLabel(_rEl, holder._requestedModel, holder._actualModel, {
                         suffix: holder._roleSuffix,
@@ -2516,7 +2514,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 if (json.screenshot && currentToolBubble) {
                   const contentEl = currentToolBubble.querySelector('.agent-thread-content');
                   if (contentEl) {
-                    const screenshotSrc = chatRenderer.safeToolScreenshotSrc(json.screenshot);
+                    const screenshotSrc = safeToolScreenshotSrc(json.screenshot);
                     if (screenshotSrc) {
                       const details = document.createElement('details');
                       details.className = 'agent-tool-output';
@@ -2644,7 +2642,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 const metaS = sessionModule.getSessions().find(s => s.id === streamSessionId);
                 const _roundRequested = holder?._requestedModel || metaS?.model;
                 const _roundActual = holder?._actualModel || _roundRequested;
-                newRole.textContent = _modelRouteLabel(_roundRequested, _roundActual) || '';
+                newRole.textContent = modelRouteLabel(_roundRequested, _roundActual) || '';
                 _applyModelColor(newRole, _roundActual);
                 newWrap.appendChild(newRole);
                 const newBody = document.createElement('div');
@@ -3532,7 +3530,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     const holder = document.createElement('div');
     holder.className = 'msg msg-ai';
     const meta = sessionModule.getSessions().find(s => s.id === sessionId);
-    const roleLabel = _shortModel(meta && meta.model);
+    const roleLabel = shortModel(meta && meta.model);
     const roleTs = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     holder.innerHTML = '<div class="role">' + uiModule.esc(roleLabel) +
       ' <span class="role-timestamp">' + roleTs + '</span></div>' +
@@ -3699,7 +3697,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       var holder = document.createElement('div');
       holder.className = 'msg msg-ai';
       var meta = sessionModule.getSessions().find(function(s) { return s.id === sessionId; });
-      var roleLabel = _shortModel(meta && meta.model);
+      var roleLabel = shortModel(meta && meta.model);
       var roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
       holder.innerHTML = '<div class="role">' + uiModule.esc(roleLabel) + ' <span class="role-timestamp">' + roleTs + '</span></div><div class="body"></div>';
       _applyModelColor(holder.querySelector('.role'), meta && meta.model);
@@ -4476,7 +4474,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
               var _role = document.createElement('div');
               _role.className = 'role';
               var _meta = sessionModule.getSessions().find(function(s) { return s.id === sessionId; });
-              _role.textContent = _shortModel(_meta?.model);
+              _role.textContent = shortModel(_meta?.model);
               _applyModelColor(_role, _meta?.model);
               _role.appendChild(chatRenderer.roleTimestamp());
               var _body = document.createElement('div');
@@ -4512,7 +4510,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       holder.dataset.researchSession = sessionId;
       const roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
       const agentMeta = sessionModule.getSessions().find(s => s.id === sessionModule.getCurrentSessionId());
-      const agentModelLabel = _shortModel(agentMeta?.model);
+      const agentModelLabel = shortModel(agentMeta?.model);
       holder.innerHTML = `<div class="role">${uiModule.esc(agentModelLabel)} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
       _applyModelColor(holder.querySelector('.role'), agentMeta?.model);
       box.appendChild(holder);
@@ -5163,7 +5161,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     hideWelcomeScreen: chatRenderer.hideWelcomeScreen,
     showWelcomeScreen: chatRenderer.showWelcomeScreen,
     checkPendingResearch,
-    getImageCost: chatRenderer.getImageCost,
+    getImageCost: getImageCost,
     setDisplayOverride,
     setHideUserBubble,
     setPendingContinue,
@@ -5206,3 +5204,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
   export default chatModule;
   window.chatModule = chatModule;
+
+
+
+
