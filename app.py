@@ -463,6 +463,10 @@ class _RevalidatingStatic(StaticFiles):
 
 app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 
+_charting_dir = os.path.join(BASE_DIR, "charting_library-master")
+if os.path.isdir(_charting_dir):
+    app.mount("/charting_library", _RevalidatingStatic(directory=_charting_dir), name="charting_library")
+
 # ========= GENERATED IMAGES =========
 @app.get("/api/generated-image/{filename}")
 async def serve_generated_image(filename: str, request: Request):
@@ -629,6 +633,12 @@ memory_router = setup_memory_routes(memory_manager, session_manager, memory_vect
 app.include_router(memory_router)
 from routes.skills_routes import setup_skills_routes
 app.include_router(setup_skills_routes(skills_manager))
+
+# Forex datafeed and trading APIs
+from routes.datafeed_routes import setup_datafeed_routes
+from routes.trading_routes import setup_trading_routes
+app.include_router(setup_datafeed_routes())
+app.include_router(setup_trading_routes())
 
 # Chat
 from routes.chat_routes import setup_chat_routes

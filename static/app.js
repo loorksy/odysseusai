@@ -45,6 +45,7 @@ import spinnerModule from './js/spinner.js';
 import { initKeyboardShortcuts } from './js/keyboard-shortcuts.js';
 import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js';
 import { initSectionCollapse, initSectionDrag } from './js/section-management.js';
+import forexChartModule from './js/forex_chart.js';
 
 const API_BASE = window.location.origin;
 window.themeModule = themeModule;
@@ -3459,6 +3460,7 @@ function startOdysseusApp() {
   // Set CSS variables
   document.documentElement.style.setProperty('--line-height', '20px');
   initRailHoverLabels();
+  if (forexChartModule && forexChartModule.initForexWorkspace) forexChartModule.initForexWorkspace();
 
   // Smooth keyboard open/close on mobile — keep chat scrolled to bottom
   if (window.visualViewport && 'ontouchstart' in window) {
