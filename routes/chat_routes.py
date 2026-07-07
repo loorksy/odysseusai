@@ -45,6 +45,53 @@ from src.tool_policy import build_effective_tool_policy
 
 logger = logging.getLogger(__name__)
 
+_FOREX_KEYWORDS = {
+    "forex", "fx", "trading", "trade", "currency", "currencies", "pair", "pairs", "pip", "pips",
+    "eur", "usd", "gbp", "jpy", "aud", "cad", "chf", "nzd", "xau", "oanda", "chart",
+    "candle", "candles", "rsi", "macd", "bollinger", "stochastic", "ichimoku", "fibonacci",
+    "support", "resistance", "entry", "stop", "loss", "take", "profit", "risk", "market", "news",
+    "فوركس", "تداول", "عملة", "عملات", "زوج", "أزواج", "تحليل", "فني", "اخبار", "أخبار",
+    "شموع", "دعم", "مقاومة", "دخول", "وقف", "خسارة", "ربح", "مخاطر", "سوق",
+}
+
+def _forex_agent_only_enabled() -> bool:
+    return os.getenv("FOREX_AGENT_ONLY", "false").lower() in {"1", "true", "yes", "on"}
+
+def _looks_forex_related(message: str) -> bool:
+    text = (message or "").lower()
+    return any(keyword in text for keyword in _FOREX_KEYWORDS)
+
+def _forex_refusal(message: str) -> str | None:
+    if not _forex_agent_only_enabled() or _looks_forex_related(message):
+        return None
+    if any("؀" <= ch <= "ۿ" for ch in message or ""):
+        return "أنا وكيل تداول فوركس فقط. يمكنني مساعدتك في الأزواج، الشارت، التحليل الفني، الأخبار، إدارة المخاطر، والتوصيات الورقية فقط."
+    return "I am a Forex trading agent only. I can help with currency pairs, charts, technical/news analysis, risk management, and paper-trading recommendations only."
+
+def _selected_pair_context(request: Request) -> dict | None:
+    user = effective_user(request) or "default"
+    try:
+        with open(os.path.join("data", "paper_trades.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        pair = data.get("_settings", {}).get(user, {}).get("selected_pair")
+    except Exception:
+        pair = None
+    if not pair:
+        return None
+    return {
+        "role": "system",
+        "content": (
+            "Forex session context: the user selected pair on the TradingView chart is "
+            f"{pair}. Treat this as the default pair for analysis, news, recommendations, "
+            "chart drawing, and paper-trade discussion unless the user explicitly chooses another pair."
+        ),
+    }
+
+def _inject_selected_pair_context(ctx, request: Request) -> None:
+    pair_context = _selected_pair_context(request)
+    if pair_context:
+        ctx.messages.insert(len(ctx.preface), pair_context)
+
 # Track active streams for partial-save safety net
 _active_streams: Dict[str, dict] = {}
 _IMAGE_MODEL_PREFIXES = ("gpt-image", "dall-e", "chatgpt-image")
@@ -349,6 +396,9 @@ def setup_chat_routes(
         _set_user_time_from_request(request)
 
         message = chat_request.message
+        refusal = _forex_refusal(message)
+        if refusal:
+            return {"response": refusal}
         session = chat_request.session
         att_ids = chat_request.attachments or []
         use_web = chat_request.use_web
@@ -404,6 +454,7 @@ def setup_chat_routes(
             webhook_manager=webhook_manager,
             allow_tool_preprocessing=allow_tool_preprocessing,
         )
+        _inject_selected_pair_context(ctx, request)
 
         # Research injection
         research_blocked_by_policy = (
@@ -472,6 +523,12 @@ def setup_chat_routes(
 
         form_data = await request.form()
         message = form_data.get("message")
+        stream_refusal = _forex_refusal(message)
+        if stream_refusal:
+            async def _refuse_stream():
+                yield f"data: {stream_refusal}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(_refuse_stream(), media_type="text/event-stream")
         session = form_data.get("session")
         attachments = form_data.get("attachments")
         use_web = form_data.get("use_web")
@@ -681,6 +738,7 @@ def setup_chat_routes(
             agent_mode=(chat_mode == "agent"),
             allow_tool_preprocessing=allow_tool_preprocessing,
         )
+        _inject_selected_pair_context(ctx, request)
 
         _research_flags = {"do": do_research}  # Mutable container for generator scope
 

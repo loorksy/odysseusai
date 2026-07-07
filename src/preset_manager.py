@@ -7,6 +7,12 @@ logger = logging.getLogger(__name__)
 
 class PresetManager:
     DEFAULT_PRESETS = {
+        "forex_trading_agent": {
+            "name": "Forex Trading Agent",
+            "temperature": 0.2,
+            "max_tokens": 4096,
+            "system_prompt": """You are Odysseus Forex Trading Agent. You only discuss forex trading, technical analysis, market news, risk management, paper-trading recommendations, and the currently selected currency pair. Politely refuse any non-trading request. Reply in the user's language (Arabic or English). If a selected_pair is provided in session context, use it as the default pair. Never claim to execute live trades; OANDA demo data is for market data only and all trades are paper-trading recommendations."""
+        },
         "code_analyze": {
             "name": "Code Analyze",
             "temperature": 0.2,
